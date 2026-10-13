@@ -1,0 +1,49 @@
+import ipaddress
+import re
+from urllib.parse import urlsplit
+
+from .errors import ClientError
+
+
+def canonical_origin(origin: str) -> str:
+    if (
+        not isinstance(origin, str)
+        or not origin
+        or any(ord(char) <= 32 or ord(char) == 127 for char in origin)
+        or any(char in origin for char in "? #@\\%")
+    ):
+        raise ClientError("invalid_origin")
+    result: str | None = None
+    try:
+        parsed = urlsplit(origin)
+        host = parsed.hostname
+        port = parsed.port
+        if (
+            parsed.scheme in {"http", "https"}
+            and host
+            and parsed.path in {"", "/"}
+            and not parsed.netloc.endswith(":")
+            and (port is None or port > 0)
+        ):
+            address: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                pass
+            if parsed.scheme == "https" or (address and address.is_loopback):
+                if address:
+                    host = (
+                        f"[{address.compressed}]"
+                        if address.version == 6
+                        else str(address)
+                    )
+                elif not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host):
+                    raise ValueError
+                default = 443 if parsed.scheme == "https" else 80
+                suffix = f":{port}" if port and port != default else ""
+                result = f"{parsed.scheme}://{host}{suffix}"
+    except ValueError:
+        pass
+    if result is None:
+        raise ClientError("invalid_origin")
+    return result
