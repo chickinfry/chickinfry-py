@@ -115,13 +115,17 @@ def postgres(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PostgreSQL]:
     name = "chickinfry-py238-" + uuid4().hex[:12]
     password = secrets.token_urlsafe(32)
     env = {**os.environ, "POSTGRES_PASSWORD": password}
+    labels = ["--label", "com.chickinfry.test=python"]
+    if run_id := os.environ.get("GITHUB_RUN_ID"):
+        labels.extend(["--label", f"com.chickinfry.run={run_id}"])
     result = subprocess.run(
         [
             "docker",
             "run",
             "-d",
             "--pull",
-            "never",
+            "missing",
+            *labels,
             "--name",
             name,
             "-p",
@@ -134,7 +138,7 @@ def postgres(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PostgreSQL]:
             "POSTGRES_DB=test",
             "-v",
             f"{tls_dir}:/tls:ro",
-            "postgres:18-alpine",
+            "postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
             "sh",
             "-c",
             "cp /tls/server.crt /tmp/server.crt && cp /tls/server.key /tmp/server.key && "
@@ -144,10 +148,13 @@ def postgres(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PostgreSQL]:
         ],
         env=env,
         capture_output=True,
+        text=True,
         timeout=30,
     )
     try:
-        assert result.returncode == 0, "Could not start the existing PostgreSQL image."
+        assert result.returncode == 0, (
+            f"Could not start the pinned PostgreSQL image: {result.stderr.strip()}"
+        )
         deadline = time.monotonic() + 30
         while True:
             ready = subprocess.run(
