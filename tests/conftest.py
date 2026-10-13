@@ -7,6 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from .server_fixture import db as db
+from .server_fixture import postgres as postgres
+
 _deadline_tight_nodeids = pytest.StashKey[frozenset[str]]()
 
 

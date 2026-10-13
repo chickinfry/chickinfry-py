@@ -104,3 +104,24 @@ Do not increase that bound to accommodate competing heavy processes.
 checks with a phase timeout of at least 10 seconds and a 0.20-second remaining
 deadline. Their wider scheduling margin is not evidence of the tight bound.
 Deadline measurements are written under `.evidence/`.
+
+Install the test tools and the server extra before running the full suite:
+
+```sh
+python -m pip install -r requirements-dev.txt -e '.[server]'
+python -m pytest
+python -m ruff check src tests
+python -m mypy --strict src tests
+```
+
+Server tests require asyncpg from `chickinfry[server]`, Docker, OpenSSL, and an already
+available `postgres:18-alpine` image. Tests never pull images. They create a
+disposable database bound to loopback and remove its container and volumes.
+The temporary test filesystem needs at least 4 GiB free before startup;
+tests stop below 3 GiB. Client installations do not need the server extra.
+
+The pinned asyncpg driver does not provide SCRAM-SHA-256-PLUS.
+`channel_binding=require` is rejected before connecting; `prefer` permits
+ordinary SCRAM when binding is unavailable, and `disable` does not use it.
+Omitting that option does not require binding. These options do not change the
+explicit TLS certificate and hostname checks selected by `sslmode`.
