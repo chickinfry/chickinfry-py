@@ -8,11 +8,12 @@ from pathlib import Path
 from typing import TypeVar
 from uuid import UUID
 
+from chickinfry._auth_database import Database as PrivateDatabase
+from chickinfry._auth_database import create_database
 from chickinfry.auth import Auth, CleanupContext, hash_token, random_token
 from chickinfry.orm import DatabasePort, format_timestamp
 from chickinfry.postgres import PostgresPort
 
-from .auth_fixture import PrivateDatabase, create_database
 from .server_fixture import Harness
 
 T = TypeVar("T")

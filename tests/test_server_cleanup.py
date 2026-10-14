@@ -4,11 +4,11 @@ from collections.abc import Coroutine
 import pytest
 
 import chickinfry.postgres as postgres_module
+from chickinfry._auth_database import create_database
 from chickinfry.auth import Auth, CleanupContext
 from chickinfry.orm import DatabasePort
 from chickinfry.postgres import PostgresPort
 
-from .auth_fixture import create_database
 from .server_fixture import Harness
 from .server_peer import stalled_peer
 

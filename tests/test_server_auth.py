@@ -7,6 +7,13 @@ from uuid import uuid4
 
 import pytest
 
+from chickinfry._auth_database import (
+    AppAuthInvitesRow,
+    create_database,
+)
+from chickinfry._auth_database import (
+    Database as PrivateDatabase,
+)
 from chickinfry.auth import (
     Auth,
     AuthDatabase,
@@ -22,7 +29,6 @@ from chickinfry.orm import DatabasePort, Filter, Repository, format_timestamp
 from chickinfry.postgres import CommitOutcomeUnknown, PostgresPort
 from chickinfry.server import ServerError, Session
 
-from .auth_fixture import AppAuthInvitesRow, PrivateDatabase, create_database
 from .server_fixture import Harness, records
 
 PASSWORD = "a long test password 🎉"
