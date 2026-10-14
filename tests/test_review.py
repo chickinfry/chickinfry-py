@@ -546,9 +546,30 @@ async def test_private_outcome_unknown_observes_send_progress(
                 assert caught.value._outcome_unknown == (
                     failure in {"mid_send", "timeout", "disconnect"}
                 )
-                import chickinfry
 
-                assert "_outcome_unknown" not in chickinfry.__all__
+
+def test_package_does_not_export_private_conformance_hooks() -> None:
+    import chickinfry
+    from chickinfry import _conformance
+
+    assert set(chickinfry.__all__) == {
+        "HTTP",
+        "SyncClientTransport",
+        "AsyncHTTP",
+        "ClientTransport",
+        "ClientError",
+        "OperationError",
+        "SessionCredentials",
+        "SessionStore",
+    }
+    private = {"_observer", "_Observation", "_outcome_unknown"}
+    assert private.isdisjoint(vars(chickinfry))
+    assert private.isdisjoint(dir(chickinfry))
+    assert not any(hasattr(chickinfry, name) for name in private)
+    # Importing a submodule installs its own name on the parent package.
+    assert {
+        name for name, value in vars(chickinfry).items() if value is _conformance
+    } == {"_conformance"}
 
 
 @pytest.mark.parametrize(

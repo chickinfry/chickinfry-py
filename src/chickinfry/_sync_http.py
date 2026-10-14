@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from http.cookiejar import CookieJar
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
+from ._conformance import _observer
 from ._http_common import (
     _HEADERS,
     _Body,
@@ -346,6 +347,9 @@ class HTTP:
         credentials: bool = False,
     ) -> object:
         state = _state.get() or _RequestState()
+        observation = _observer.get()
+        if observation is not None:
+            deadline = min(deadline, observation.deadline)
         with _request_logs():
             deadline = min(deadline, time.monotonic() + self._timeout)
             client = self._http_client(deadline)
@@ -372,6 +376,10 @@ class HTTP:
                         extensions={"trace": state.trace},
                     ) as response:
                         status = response.status_code
+                        if observation is not None:
+                            observation.record_headers(
+                                status, response.headers.values()
+                            )
                         if 300 <= status < 400:
                             state.finish()
                             raise OperationError("redirect_not_allowed", status)
@@ -383,6 +391,8 @@ class HTTP:
                             decoder.feed(chunk)
                             _remaining()
                         data = decoder.finish()
+                        if observation is not None:
+                            observation.record_body(data)
                         state.finish()
                         value = _response(data, status)
                         if credentials:
@@ -400,7 +410,9 @@ class HTTP:
                     TimeoutError,
                     httpcore.TimeoutException,
                     httpx.TimeoutException,
-                ):
+                ) as error:
+                    if observation is not None:
+                        observation.details.extend((type(error).__name__, str(error)))
                     reason = "timeout"
                 except (
                     httpcore.NetworkError,
@@ -409,7 +421,9 @@ class HTTP:
                     OSError,
                     RuntimeError,
                     ValueError,
-                ):
+                ) as error:
+                    if observation is not None:
+                        observation.details.extend((type(error).__name__, str(error)))
                     reason = "network_error"
                 except ClientError as error:
                     failure = error

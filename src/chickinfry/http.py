@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from http.cookiejar import CookieJar
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
+from ._conformance import _observer
 from ._http_common import (
     _HEADERS,
     _Body,
@@ -250,6 +251,9 @@ class AsyncHTTP:
             deadline if deadline is not None else now + self._timeout,
             now + self._timeout,
         )
+        observation = _observer.get()
+        if observation is not None:
+            deadline = min(deadline, observation.deadline)
         state = _RequestState()
         with _request_logs():
             import httpx
@@ -273,10 +277,16 @@ class AsyncHTTP:
                         extensions={"trace": state.atrace},
                     ) as response:
                         status = response.status_code
+                        if observation is not None:
+                            observation.record_headers(
+                                status, response.headers.values()
+                            )
                         if 300 <= status < 400:
                             state.finish()
                             raise OperationError("redirect_not_allowed", status)
                         data = await _read_body(response)
+                        if observation is not None:
+                            observation.record_body(data)
                         state.finish()
                         _check_deadline(deadline)
                         value = _response(data, status)
@@ -287,9 +297,13 @@ class AsyncHTTP:
                                 failure = ClientError("invalid_response", status)
                         _check_deadline(deadline)
                     _check_deadline(deadline)
-            except (TimeoutError, httpx.TimeoutException):
+            except (TimeoutError, httpx.TimeoutException) as error:
+                if observation is not None:
+                    observation.details.extend((type(error).__name__, str(error)))
                 failure = ClientError("timeout", status)
-            except (httpx.HTTPError, OSError, RuntimeError):
+            except (httpx.HTTPError, OSError, RuntimeError) as error:
+                if observation is not None:
+                    observation.details.extend((type(error).__name__, str(error)))
                 failure = ClientError("network_error", status)
             except ClientError as error:
                 failure = error

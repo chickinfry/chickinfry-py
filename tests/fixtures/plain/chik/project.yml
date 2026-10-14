@@ -1,0 +1,6 @@
+project:
+  name: conformance
+generation:
+  server:
+    language: typescript
+  clients: [python]

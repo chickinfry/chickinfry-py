@@ -97,6 +97,9 @@ Install development tools with `python -m pip install -r requirements-dev.txt`
 and `python -m pip install --no-deps -e .`. Run `ruff check src tests`,
 `ruff format --check src tests`, and `mypy --strict src tests`.
 
+The root `requirements.txt` pins only the conformance driver's offline
+dependencies. Runtime installation requirements are defined in `pyproject.toml`.
+
 `pytest -q` runs both deadline tiers, including in CI. On an idle machine,
 `pytest -q -m deadline_tight` checks the measured 0.05-second overshoot bound.
 Do not increase that bound to accommodate competing heavy processes.

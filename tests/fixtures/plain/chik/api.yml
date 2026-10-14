@@ -1,0 +1,23 @@
+services:
+  probe:
+    operations:
+      echo:
+        input:
+          wire_value: {type: string}
+        output:
+          wire_value: {type: string}
+          observed_at: {type: timestamp}
+      list:
+        input: {}
+        output:
+          rows:
+            type: list
+            items:
+              id: {type: id}
+              wire_value: {type: string}
+              observed_at: {type: timestamp}
+      identify:
+        input:
+          id: {type: id}
+        output:
+          id: {type: id}
