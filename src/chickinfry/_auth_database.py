@@ -304,7 +304,9 @@ def _decode_app_auth_refresh_tokens(
 class AppAuthSessionsRow:
     created_at: _builtins.str
     expires_at: _builtins.str
+    first_login_at: _builtins.str | None
     id: _builtins.str
+    last_renewed_at: _builtins.str | None
     revoked_at: _builtins.str | None
     token_hash: _builtins.str
     transport: _builtins.str
@@ -325,10 +327,20 @@ _app_auth_sessions_table = Table(
             "timestamp",
             False,
         ),
+        "first_login_at": Column[_builtins.str | None](
+            "first_login_at",
+            "timestamp",
+            True,
+        ),
         "id": Column[_builtins.str](
             "id",
             "id",
             False,
+        ),
+        "last_renewed_at": Column[_builtins.str | None](
+            "last_renewed_at",
+            "timestamp",
+            True,
         ),
         "revoked_at": Column[_builtins.str | None](
             "revoked_at",
@@ -372,7 +384,9 @@ def _decode_app_auth_sessions(
     return AppAuthSessionsRow(
         created_at=_read_string(row["created_at"]),
         expires_at=_read_string(row["expires_at"]),
+        first_login_at=_read_string_nullable(row["first_login_at"]),
         id=_read_string(row["id"]),
+        last_renewed_at=_read_string_nullable(row["last_renewed_at"]),
         revoked_at=_read_string_nullable(row["revoked_at"]),
         token_hash=_read_string(row["token_hash"]),
         transport=_read_string(row["transport"]),
