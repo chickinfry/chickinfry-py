@@ -122,7 +122,9 @@ class PostgresPort:
         options = dict(parse_qsl(url.query, keep_blank_values=True))
         if options.get("channel_binding") == "require":
             raise ValueError(
-                "channel_binding=require is not supported by this runtime."
+                "channel_binding=require is not supported by this runtime. "
+                "Remove channel_binding from the database URL; the connection "
+                "still verifies TLS with sslmode=verify-full."
             )
         # The pinned asyncpg offers no PLUS mechanism, so prefer may use plain SCRAM.
         options.pop("channel_binding", None)

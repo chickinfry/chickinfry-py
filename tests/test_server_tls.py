@@ -97,7 +97,9 @@ async def test_optional_channel_binding_preserves_tls_policy(
 @pytest.mark.parametrize("mode", [None, "disable", "require", "no-verify"])
 def test_required_channel_binding_rejected_before_connect(mode: str | None) -> None:
     query = "channel_binding=require" + ("" if mode is None else "&sslmode=" + mode)
-    with pytest.raises(ValueError, match="channel_binding=require"):
+    with pytest.raises(
+        ValueError, match="Remove channel_binding from the database URL"
+    ):
         PostgresPort("postgresql://test:test@127.0.0.1:5432/test?" + query)
 
 
