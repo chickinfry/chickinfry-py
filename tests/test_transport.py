@@ -9,10 +9,12 @@ import traceback
 import zlib
 from collections.abc import Mapping
 from pathlib import Path
+from urllib.parse import SplitResult
 
 import pytest
 
 from chickinfry import (
+    HTTP,
     AsyncHTTP,
     ClientError,
     OperationError,
@@ -34,6 +36,15 @@ from .peer import Peer, Received, json_bytes, respond
         "http://127.0.0.256",
         "http://0127.0.0.1",
         "http://[::2]",
+        "http://[::ffff:127.0.0.1]",
+        "http://[0:0:0:0:0:ffff:7f00:1]",
+        "http://[::127.0.0.1]",
+        "http://[::7f00:1]",
+        "http://[64:ff9b::127.0.0.1]",
+        "http://[64:ff9b::7f00:1]",
+        "http://[2002:7f00:1::]",
+        "http://[::192.0.2.1]",
+        "http://[::c000:201]",
         "https://@example.com",
         "https://user@example.com",
         "https://example.com/api",
@@ -52,11 +63,12 @@ from .peer import Peer, Received, json_bytes, respond
         "ftp://127.0.0.1",
     ],
 )
-def test_origin_rejected(origin: str) -> None:
+@pytest.mark.parametrize("transport", [HTTP, AsyncHTTP])
+def test_origin_rejected(origin: str, transport: type[HTTP] | type[AsyncHTTP]) -> None:
     with pytest.raises(
         ClientError, check=lambda error: error.reason == "invalid_origin"
     ):
-        AsyncHTTP(origin)
+        transport(origin)
 
 
 @pytest.mark.parametrize(
@@ -65,10 +77,32 @@ def test_origin_rejected(origin: str) -> None:
         "https://EXAMPLE.com:443/",
         "http://127.0.0.2/",
         "http://[0:0:0:0:0:0:0:1]:80/",
+        "http://[::1]",
+        "http://[::0.0.0.1]",
+        "https://[::ffff:127.0.0.1]",
     ],
 )
-def test_origin_accepted(origin: str) -> None:
-    AsyncHTTP(origin)
+@pytest.mark.parametrize("transport", [HTTP, AsyncHTTP])
+def test_origin_accepted(origin: str, transport: type[HTTP] | type[AsyncHTTP]) -> None:
+    transport(origin)
+
+
+@pytest.mark.parametrize("authority", ["[::1]suffix", "prefix[::1]"])
+@pytest.mark.parametrize("transport", [HTTP, AsyncHTTP])
+def test_origin_rejects_bracket_suffix_and_prefix_with_legacy_parser(
+    authority: str,
+    transport: type[HTTP] | type[AsyncHTTP],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chickinfry import _origin
+
+    # Early Python 3.11 urlsplit accepted these authorities before hostname extraction.
+    parsed = SplitResult("http", authority, "", "", "")
+    monkeypatch.setattr(_origin, "urlsplit", lambda origin: parsed)
+    with pytest.raises(
+        ClientError, check=lambda error: error.reason == "invalid_origin"
+    ):
+        transport("http://" + authority)
 
 
 @pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), float("nan"), True])

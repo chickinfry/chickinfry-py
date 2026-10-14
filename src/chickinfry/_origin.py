@@ -18,6 +18,10 @@ def canonical_origin(origin: str) -> str:
         parsed = urlsplit(origin)
         host = parsed.hostname
         port = parsed.port
+        if any(char in parsed.netloc for char in "[]") and not re.fullmatch(
+            r"\[[^\[\]]+\](?::[0-9]+)?", parsed.netloc
+        ):
+            raise ValueError
         if (
             parsed.scheme in {"http", "https"}
             and host
@@ -30,7 +34,14 @@ def canonical_origin(origin: str) -> str:
                 address = ipaddress.ip_address(host)
             except ValueError:
                 pass
-            if parsed.scheme == "https" or (address and address.is_loopback):
+            if parsed.scheme == "https" or (
+                address
+                and (
+                    address.is_loopback
+                    if isinstance(address, ipaddress.IPv4Address)
+                    else address == ipaddress.IPv6Address("::1")
+                )
+            ):
                 if address:
                     host = (
                         f"[{address.compressed}]"

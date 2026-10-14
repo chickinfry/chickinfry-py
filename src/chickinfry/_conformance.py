@@ -47,19 +47,42 @@ class _Observation:
         self.body_checked = True
 
     def raw_details(self, error: Exception) -> bool | None:
-        visible: tuple[str, ...] = (
-            str(error),
-            repr(error).removeprefix(type(error).__name__ + "("),
-        )
-        # Only an unchanged diagnostic argument is known to be safe.
-        if isinstance(error, ClientError) and error.args == (_MESSAGES[error.reason],):
-            visible = ()
-        # Even short response values must fail closed when they appear in an error.
-        if any(
-            detail.strip() and any(detail in text for text in visible)
-            for detail in self.details
-        ):
-            return True
+        seen: set[int] = set()
+        pending: list[tuple[BaseException, int]] = [(error, 0)]
+        while pending:
+            current, depth = pending.pop()
+            if id(current) in seen:
+                continue
+            if depth >= 32 or len(seen) >= 32:
+                return None
+            seen.add(id(current))
+            visible = list(getattr(current, "__notes__", ()))
+            if isinstance(current, BaseExceptionGroup):
+                visible.append(current.message)
+            # Only an unchanged diagnostic argument is known to be safe.
+            elif not (
+                isinstance(current, ClientError)
+                and current.args == (_MESSAGES[current.reason],)
+            ):
+                visible.extend(
+                    (
+                        str(current),
+                        repr(current).removeprefix(type(current).__name__ + "("),
+                    )
+                )
+            # Even short response values must fail closed in every visible error.
+            if any(
+                detail.strip() and any(detail in text for text in visible)
+                for detail in self.details
+            ):
+                return True
+            if isinstance(current, BaseExceptionGroup):
+                pending.extend((child, depth + 1) for child in current.exceptions)
+            cause = current.__cause__ or (
+                None if current.__suppress_context__ else current.__context__
+            )
+            if cause is not None:
+                pending.append((cause, depth + 1))
         if self.status is not None and not self.body_checked:
             return None
         return False if isinstance(error, ClientError) else None
