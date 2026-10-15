@@ -1,8 +1,10 @@
 import asyncio
+import gc
 import json
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta, timezone
 from pathlib import Path
@@ -17,9 +19,9 @@ from chickinfry.errors import OperationError
 from chickinfry.orm import format_timestamp, parse_timestamp
 from chickinfry.server import (
     Application,
-    Context,
     Operation,
     Request,
+    RequestInfo,
     RequestScope,
     ServerError,
     Session,
@@ -29,10 +31,14 @@ from chickinfry.server import (
     _JSHeaders,
     bearer,
     create_worker_entrypoint,
-    require_session,
 )
 
 from .server_fixture import Harness, records
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _Scope:
+    session: Session | None = None
 
 
 @dataclass
@@ -71,22 +77,22 @@ class Probe:
         self.calls = self.opened = self.closed = 0
         self.failure: Exception | None = None
 
-    async def open(self, request: Request) -> RequestScope[Context[None]]:
+    async def open(self, request: Request) -> RequestScope[_Scope]:
         self.opened += 1
         assert bearer(request.headers) is None
 
         async def close() -> None:
             self.closed += 1
 
-        return RequestScope(Context(), close)
+        return RequestScope(_Scope(), close)
 
-    async def invoke(self, context: Context[None], value: str) -> Mapping[str, object]:
+    async def invoke(self, context: _Scope, value: str) -> Mapping[str, object]:
         self.calls += 1
         if self.failure is not None:
             raise self.failure
         return {"wire_value": value, "internal_note": "hidden"}
 
-    def app(self) -> Application[Context[None]]:
+    def app(self) -> Application[_Scope]:
         return Application(
             {"probe.echo": Operation(decode, self.invoke, encode)},
             self.open,
@@ -107,7 +113,7 @@ async def test_api_id_preserves_non_uuid_string_before_handler(failed: bool) -> 
     probe = Probe()
     received: list[str] = []
 
-    async def handler(context: Context[None], id: str) -> Mapping[str, object]:
+    async def handler(context: _Scope, id: str) -> Mapping[str, object]:
         received.append(id)
         if failed:
             raise ValueError("private business detail")
@@ -136,7 +142,7 @@ async def test_api_id_missing_null_number_rejected(value: Mapping[str, object]) 
     probe = Probe()
     received: list[str] = []
 
-    async def handler(context: Context[None], id: str) -> Mapping[str, object]:
+    async def handler(context: _Scope, id: str) -> Mapping[str, object]:
         received.append(id)
         return {"id": id}
 
@@ -284,8 +290,9 @@ async def test_routes_cors_and_auth_before_handler() -> None:
 
     probe.failure = ServerError("not_implemented", 501)
 
-    async def protected(context: Context[None], text: str) -> Mapping[str, object]:
-        require_session(context)
+    async def protected(context: _Scope, text: str) -> Mapping[str, object]:
+        if context.session is None:
+            raise ServerError("unauthenticated", 401)
         return await probe.invoke(context, text)
 
     protected_app = Application(
@@ -303,13 +310,13 @@ async def test_native_refresh_failure_never_sets_cookie(db: Harness) -> None:
     """M08: detect cookie deletion on an actual native refresh failure response."""
     core = Auth(db.port(), create_database, now=db.now)
 
-    async def scope(request: Request) -> RequestScope[Context[None]]:
+    async def scope(request: Request) -> RequestScope[_Scope]:
         async def close() -> None:
             pass
 
-        return RequestScope(Context(), close)
+        return RequestScope(_Scope(), close)
 
-    async def refresh(context: Context[None], value: str) -> Mapping[str, object]:
+    async def refresh(context: _Scope, value: str) -> Mapping[str, object]:
         return (await core.refresh(value)).to_wire()
 
     app = Application(
@@ -356,17 +363,19 @@ async def test_auth_session_effective_expiry(
         absolute_lifetime_seconds=absolute_seconds,
     )
 
-    async def scope(request: Request) -> RequestScope[Context[None]]:
+    async def scope(request: Request) -> RequestScope[_Scope]:
         token = bearer(request.headers)
         assert token is not None
 
         async def close() -> None:
             pass
 
-        return RequestScope(Context(session=await core.session(token)), close)
+        return RequestScope(_Scope(session=await core.session(token)), close)
 
-    async def session(context: Context[None], value: Mapping[str, object]) -> Session:
-        return require_session(context)
+    async def session(context: _Scope, value: Mapping[str, object]) -> Session:
+        if context.session is None:
+            raise ServerError("unauthenticated", 401)
+        return context.session
 
     def encode_session(value: Session) -> Mapping[str, object]:
         return {
@@ -408,16 +417,16 @@ async def test_all_outcomes_close_real_port(db: Harness, mode: str) -> None:
     opened = []
     backends = []
 
-    async def scope(request: Request) -> RequestScope[Context[None]]:
+    async def scope(request: Request) -> RequestScope[_Scope]:
         port = db.port()
         opened.append(port)
         await records(port).find_many()
         backends.append(
             (await port.query("select pg_backend_pid() as pid", ()))[0]["pid"]
         )
-        return RequestScope(Context(), port.close)
+        return RequestScope(_Scope(), port.close)
 
-    async def broken(context: Context[None], text: str) -> Mapping[str, object]:
+    async def broken(context: _Scope, text: str) -> Mapping[str, object]:
         if mode == "success":
             return {"wire_value": text}
         if mode == "handler_failure":
@@ -441,13 +450,13 @@ async def test_cancel_closes_scope(db: Harness) -> None:
     begun = asyncio.Event()
     ports = []
 
-    async def scope(request: Request) -> RequestScope[Context[None]]:
+    async def scope(request: Request) -> RequestScope[_Scope]:
         port = db.port()
         ports.append(port)
         await records(port).find_many()
-        return RequestScope(Context(), port.close)
+        return RequestScope(_Scope(), port.close)
 
-    async def wait(context: Context[None], text: str) -> Mapping[str, object]:
+    async def wait(context: _Scope, text: str) -> Mapping[str, object]:
         begun.set()
         await asyncio.Future[None]()
         return {}
@@ -486,6 +495,9 @@ assert "asyncpg" not in sys.modules
 @dataclass
 class WorkersHeaders:
     values: Mapping[str, str]
+
+    def keys(self) -> Iterator[str]:
+        return iter(self.values)
 
     def get(self, key: str) -> str | None:
         lowered = key.lower()
@@ -561,11 +573,11 @@ class WorkersEntry(Protocol):
     def fetch(self, request: WorkersRequest) -> Awaitable[object]: ...
 
 
-async def test_workers_entry_admits_only_allowlisted_request_headers(
+@pytest.mark.parametrize("uses_auth", [False, True])
+async def test_workers_entry_admits_only_safe_request_headers(
     monkeypatch: pytest.MonkeyPatch,
+    uses_auth: bool,
 ) -> None:
-    # Proxy-Authorization is hop-by-hop (RFC 9110 11.7.2), and platform auth
-    # credentials must never reach generated handlers.
     source = WorkersRequest(
         method="POST",
         url="https://example.test/probe.echo",
@@ -585,22 +597,25 @@ async def test_workers_entry_admits_only_allowlisted_request_headers(
         "origin",
         "content-type",
         "authorization",
+        "cookie",
+        "x-custom",
     }
 
-    received: list[Mapping[str, str]] = []
+    received: list[RequestInfo] = []
 
-    async def scope(request: Request) -> RequestScope[Context[None]]:
-        received.append(request.headers)
+    async def scope(request: Request) -> RequestScope[RequestInfo]:
+        info = RequestInfo.from_request(request, uses_auth=uses_auth)
 
         async def close() -> None:
             return None
 
-        return RequestScope(Context(), close)
+        return RequestScope(info, close)
 
-    async def invoke(context: Context[None], value: str) -> Mapping[str, object]:
+    async def invoke(context: RequestInfo, value: str) -> Mapping[str, object]:
+        received.append(context)
         return {"wire_value": value}
 
-    def factory(env: object, ctx: object) -> Application[Context[None]]:
+    def factory(env: object, ctx: object) -> Application[RequestInfo]:
         return Application(
             {"probe.echo": Operation(decode, invoke, encode)},
             scope,
@@ -616,5 +631,161 @@ async def test_workers_entry_admits_only_allowlisted_request_headers(
     entry.ctx = object()
     await entry.fetch(source)
     assert len(received) == 1
-    assert "proxy-authorization" not in received[0]
-    assert "cookie" not in received[0]
+    info = received[0]
+    assert set(info.headers) == (
+        {"origin", "content-type", "x-custom"}
+        if uses_auth
+        else {"origin", "content-type", "x-custom", "authorization", "cookie"}
+    )
+    if not uses_auth:
+        assert all(info.headers[key] == "dummy" for key in ("authorization", "cookie"))
+    assert info.headers["x-custom"] == "dummy"
+    assert info.method == source.method and info.url == source.url
+    assert not any(hasattr(info, name) for name in ("source", "body", "env", "ctx"))
+
+
+def test_request_info_copies_and_freezes_metadata() -> None:
+    headers = {"X-Custom": "original", "PrOxY-AuThOrIzAtIoN": "dummy"}
+    info = RequestInfo("POST", "https://example.test/probe.echo", headers)
+    headers["X-Custom"] = "changed"
+    assert dict(info.headers) == {"x-custom": "original"}
+    assert "original" not in repr(info) and "example.test" not in repr(info)
+    with pytest.raises(TypeError):
+        cast(dict[str, str], info.headers)["x-custom"] = "changed"
+
+
+@pytest.mark.parametrize("failed", [False, True])
+async def test_workers_setup_is_shared_retained_and_per_instance(
+    monkeypatch: pytest.MonkeyPatch,
+    failed: bool,
+) -> None:
+    host = WorkersHost("workers")
+    host.WorkerEntrypoint = type("WorkerEntrypoint", (), {})
+    host.Response = workers_response
+    monkeypatch.setitem(sys.modules, "workers", host)
+    begun, release = asyncio.Event(), asyncio.Event()
+    setups = 0
+    factories: list[tuple[object, object, str]] = []
+    probe = Probe()
+
+    async def setup() -> str:
+        nonlocal setups
+        setups += 1
+        begun.set()
+        await release.wait()
+        if failed:
+            raise ValueError("Startup failed.")
+        return "configured"
+
+    def factory(env: object, ctx: object, options: str) -> Application[_Scope]:
+        factories.append((env, ctx, options))
+        return probe.app()
+
+    entry_class = create_worker_entrypoint(factory, setup=setup)
+    entry = cast(WorkersEntry, entry_class())
+    entry.env, entry.ctx = object(), object()
+    request = WorkersRequest(
+        "POST",
+        "https://example.test/probe.echo",
+        WorkersHeaders({"content-type": "application/json"}),
+        WorkersBody(b'{"wire_value":"ok"}'),
+    )
+    first = asyncio.ensure_future(entry.fetch(request))
+    second = asyncio.ensure_future(entry.fetch(request))
+    await begun.wait()
+    assert setups == 1 and factories == [] and probe.opened == 0
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    release.set()
+    if failed:
+        with pytest.raises(RuntimeError, match="Application setup failed"):
+            await second
+        with pytest.raises(RuntimeError, match="Application setup failed"):
+            await entry.fetch(request)
+        assert setups == 1 and factories == [] and probe.opened == 0
+    else:
+        await second
+        entry.env, entry.ctx = object(), object()
+        await entry.fetch(request)
+        assert setups == 1 and len(factories) == 2
+        assert factories[-1] == (entry.env, entry.ctx, "configured")
+        assert probe.calls == probe.opened == probe.closed == 2
+    restarted = cast(WorkersEntry, entry_class())
+    restarted.env, restarted.ctx = object(), object()
+    if failed:
+        with pytest.raises(RuntimeError, match="Application setup failed"):
+            await restarted.fetch(request)
+    else:
+        await restarted.fetch(request)
+    assert setups == 2
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_workers_failed_setup_releases_requests(
+    monkeypatch: pytest.MonkeyPatch, cancelled: bool
+) -> None:
+    host = WorkersHost("workers")
+    host.WorkerEntrypoint = type("WorkerEntrypoint", (), {})
+    host.Response = workers_response
+    monkeypatch.setitem(sys.modules, "workers", host)
+    setups = factories = 0
+    probe = Probe()
+    requests: list[weakref.ReferenceType[WorkersRequest]] = []
+    failures: list[weakref.ReferenceType[BaseException]] = []
+
+    class SetupError(ValueError):
+        pass
+
+    class SetupCancelled(asyncio.CancelledError):
+        pass
+
+    async def setup() -> str:
+        nonlocal setups
+        setups += 1
+        error = SetupCancelled("dummy") if cancelled else SetupError("dummy")
+        cause = SetupError("dummy")
+        failures.extend((weakref.ref(error), weakref.ref(cause)))
+        raise error from cause
+
+    def factory(env: object, ctx: object, options: str) -> Application[_Scope]:
+        nonlocal factories
+        factories += 1
+        return probe.app()
+
+    entry = cast(WorkersEntry, create_worker_entrypoint(factory, setup=setup)())
+    entry.env, entry.ctx = object(), object()
+
+    async def fetch_once() -> None:
+        request = WorkersRequest(
+            "POST",
+            "https://example.test/probe.echo",
+            WorkersHeaders({"authorization": "dummy", "cookie": "dummy"}),
+            WorkersBody(b"dummy"),
+        )
+        requests.append(weakref.ref(request))
+        try:
+            await entry.fetch(request)
+        except (Exception, asyncio.CancelledError):
+            pass
+        else:
+            pytest.fail("Failed setup allowed a request to succeed.")
+
+    for _ in range(4):
+        await fetch_once()
+    gc.collect()
+    task = cast(asyncio.Task[object], getattr(entry, "_chickinfry_setup"))
+    live_requests = sum(reference() is not None for reference in requests)
+    fetch_frames = sum(
+        frame.f_code.co_name == "fetch" and "request" in frame.f_locals
+        for frame in task.get_stack()
+    )
+    assert (live_requests, fetch_frames) == (0, 0)
+    assert all(reference() is None for reference in failures)
+    assert setups == 1 and factories == probe.opened == probe.calls == 0
+    assert not task.cancelled() and task.exception() is None
+    assert task.get_stack() == []
+    state = task.result()
+    assert not isinstance(state, BaseException)
+    for name in ("__traceback__", "__cause__", "__context__"):
+        assert getattr(state, name, None) is None

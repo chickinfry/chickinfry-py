@@ -5,18 +5,21 @@ connects to the host-provided workers module without adding a host dependency
 to the CPython installation.
 """
 
+import asyncio
 import json
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from importlib import import_module
-from typing import Generic, Protocol, TypeVar, cast
+from types import MappingProxyType
+from typing import Generic, Protocol, TypeVar, cast, overload
 from urllib.parse import urlsplit
 
 Input = TypeVar("Input")
 Output = TypeVar("Output")
 C = TypeVar("C")
-D = TypeVar("D")
+S = TypeVar("S")
+Options = TypeVar("Options")
 _C = TypeVar("_C", contravariant=True)
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 _STATUSES = frozenset({400, 401, 403, 404, 409, 413, 415, 429, 500, 503})
@@ -44,15 +47,8 @@ class Session:
 
 
 @dataclass(frozen=True, slots=True)
-class Context(Generic[D]):
-    session: Session | None = None
-    db: D | None = None
-
-
-def require_session(context: Context[D]) -> Session:
-    if context.session is None:
-        raise ServerError("unauthenticated", 401)
-    return context.session
+class AuthContext(Generic[S]):
+    session: S
 
 
 class Request(Protocol):
@@ -64,6 +60,40 @@ class Request(Protocol):
     def headers(self) -> Mapping[str, str]: ...
     def chunks(self) -> AsyncIterator[bytes]: ...
     async def cancel(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RequestInfo:
+    """Immutable request metadata, without a body reader or host references."""
+
+    method: str
+    url: str
+    headers: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "headers",
+            MappingProxyType(
+                {
+                    key.lower(): value
+                    for key, value in self.headers.items()
+                    if key.lower() != "proxy-authorization"
+                }
+            ),
+        )
+
+    @classmethod
+    def from_request(cls, request: Request, *, uses_auth: bool) -> "RequestInfo":
+        return cls(
+            request.method,
+            request.url,
+            {
+                key: value
+                for key, value in request.headers.items()
+                if not uses_auth or key.lower() not in {"authorization", "cookie"}
+            },
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +273,7 @@ def bearer(headers: Mapping[str, str]) -> str | None:
 
 class _JSHeaders(Protocol):
     def get(self, key: str) -> str | None: ...
+    def keys(self) -> Iterator[str]: ...
 
 
 class _Bytes(Protocol):
@@ -287,8 +318,9 @@ class _HostRequest:
     @property
     def headers(self) -> Mapping[str, str]:
         return {
-            key: value
-            for key in ("origin", "content-type", "authorization")
+            key.lower(): value
+            for key in self.source.headers.keys()
+            if key.lower() != "proxy-authorization"
             if (value := self.source.headers.get(key)) is not None
         }
 
@@ -327,20 +359,72 @@ class _HostResponse(Protocol):
     ) -> object: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _SetupFailure:
+    cancelled: bool
+
+
+@overload
 def create_worker_entrypoint(
     factory: Callable[[object, object], Application[C]],
+) -> type[object]: ...
+
+
+@overload
+def create_worker_entrypoint(
+    factory: Callable[[object, object, Options], Application[C]],
+    *,
+    setup: Callable[[], Awaitable[Options]],
+) -> type[object]: ...
+
+
+def create_worker_entrypoint(
+    factory: Callable[[object, object], Application[C]]
+    | Callable[[object, object, Options], Application[C]],
+    *,
+    setup: Callable[[], Awaitable[Options]] | None = None,
 ) -> type[object]:
     """Generated create_application returns a Default class composed with the factory.
 
     The factory receives the trusted environment and execution context per
-    request and opens no connection at import time.
+    request and opens no connection at import time. Optional setup runs once
+    per entrypoint instance, before its first application is created. Its result
+    or failure is retained, and cancelling a waiter does not cancel setup.
     """
     host = import_module("workers")
     base = cast(type[object], host.WorkerEntrypoint)
     response_factory = cast(_HostResponse, host.Response)
 
     async def fetch(self: _Worker, request: _JSRequest) -> object:
-        response = await factory(self.env, self.ctx).fetch(_HostRequest(request))
+        if setup is None:
+            application = cast(Callable[[object, object], Application[C]], factory)(
+                self.env, self.ctx
+            )
+        else:
+            task = cast(
+                asyncio.Task[Options | _SetupFailure] | None,
+                getattr(self, "_chickinfry_setup", None),
+            )
+            if task is None:
+
+                async def initialize() -> Options | _SetupFailure:
+                    try:
+                        return await setup()
+                    except (Exception, asyncio.CancelledError) as error:
+                        # Retained exceptions can acquire request frames when awaited.
+                        return _SetupFailure(isinstance(error, asyncio.CancelledError))
+
+                task = asyncio.create_task(initialize())
+                setattr(self, "_chickinfry_setup", task)
+            options = await asyncio.shield(task)
+            if isinstance(options, _SetupFailure):
+                if options.cancelled:
+                    raise asyncio.CancelledError from None
+                raise RuntimeError("Application setup failed.") from None
+            application = cast(
+                Callable[[object, object, Options], Application[C]], factory
+            )(self.env, self.ctx, options)
+        response = await application.fetch(_HostRequest(request))
         return response_factory(
             response.body.decode() if response.body else None,
             status=response.status,
