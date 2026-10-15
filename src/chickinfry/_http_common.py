@@ -9,6 +9,7 @@ from http.cookiejar import Cookie, DefaultCookiePolicy
 from typing import cast
 from urllib.request import Request
 
+from ._conformance import _observer
 from .errors import ClientError, OperationError
 
 _REQUEST_LIMIT = 4 * 1024 * 1024
@@ -128,8 +129,11 @@ class _Body:
         self._raw_size = 0
 
     def feed(self, chunk: bytes) -> None:
+        observation = _observer.get()
         self._raw_size += len(chunk)
         if self._raw_size > _RESPONSE_LIMIT:
+            if observation is not None:
+                observation.notify("limit", self)
             raise ClientError("response_too_large", self._status)
         decoded: bytes | None = None
         try:
@@ -145,6 +149,8 @@ class _Body:
             raise ClientError("invalid_response", self._status)
         self._body.extend(decoded)
         if len(self._body) > _RESPONSE_LIMIT:
+            if observation is not None:
+                observation.notify("limit", self)
             raise ClientError("response_too_large", self._status)
 
     def finish(self) -> bytes:

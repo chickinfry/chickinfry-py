@@ -11,6 +11,7 @@ from typing import cast
 import httpcore
 import httpx
 
+from ._conformance import _observer
 from .errors import ClientError
 
 _deadline: ContextVar[float] = ContextVar("chickinfry_sync_deadline")
@@ -53,11 +54,18 @@ class _Stream(httpcore.NetworkStream):
             if close:
                 sock.close()
                 self._backend._discard(self)
+                observation = _observer.get()
+                if observation is not None:
+                    observation.notify("socket-closed", self)
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         with self._io() as sock:
             sock.settimeout(_remaining(timeout))
-            return sock.recv(max_bytes)
+            data = sock.recv(max_bytes)
+            observation = _observer.get()
+            if observation is not None:
+                observation.notify("wire", (self, data))
+            return data
 
     def write(self, buffer: bytes, timeout: float | None = None) -> None:
         with self._io() as sock:
@@ -110,6 +118,9 @@ class _Stream(httpcore.NetworkStream):
         if close:
             sock.close()
             self._backend._discard(self)
+            observation = _observer.get()
+            if observation is not None:
+                observation.notify("socket-closed", self)
 
     def get_extra_info(self, info: str) -> object:
         if info == "ssl_object":
@@ -206,6 +217,9 @@ class _ResponseStream(httpx.SyncByteStream):
             self._response.close()
         finally:
             self._slots.release()
+        observation = _observer.get()
+        if observation is not None:
+            observation.notify("reader-closed", self)
 
 
 class _Transport(httpx.BaseTransport):

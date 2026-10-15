@@ -136,6 +136,7 @@ class HTTP:
     ) -> object:
         observation = _observer.get()
         if observation is not None:
+            observation.notify("entered")
             observation.arrive("sdk-entered", {"entered": True})
         deadline = time.monotonic() + 3 * self._timeout
         _check_environment()
@@ -403,20 +404,22 @@ class HTTP:
                         content=body,
                         headers=headers,
                         extensions={
-                            "trace": functools.partial(observation.trace, state)
-                            if credentials
-                            and observation is not None
-                            and observation.flight is not None
-                            and observation.flight_ref is not None
+                            "trace": functools.partial(
+                                observation.trace, state, refresh=credentials
+                            )
+                            if observation is not None
                             else state.trace
                         },
                     ) as response:
                         status = response.status_code
                         if observation is not None:
+                            observation.notify("headers", response)
                             observation.record_headers(
                                 status, response.headers.values()
                             )
                         if 300 <= status < 400:
+                            if observation is not None:
+                                observation.notify("redirect", response)
                             if not refresh:
                                 state.finish()
                             raise OperationError("redirect_not_allowed", status)
