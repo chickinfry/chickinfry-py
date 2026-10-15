@@ -2,31 +2,13 @@ import json
 import socket
 import sys
 import time
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from .deadline import Clock
 from .server_fixture import db as db
 from .server_fixture import postgres as postgres
-
-_deadline_tight_nodeids = pytest.StashKey[frozenset[str]]()
-
-
-@pytest.hookimpl(tryfirst=True)
-def pytest_collection_modifyitems(
-    config: pytest.Config, items: list[pytest.Item]
-) -> None:
-    config.stash[_deadline_tight_nodeids] = frozenset(
-        item.nodeid
-        for item in items
-        if item.get_closest_marker("deadline_tight") is not None
-    )
-
-
-@pytest.fixture
-def deadline_tight_nodeids(pytestconfig: pytest.Config) -> frozenset[str]:
-    return pytestconfig.stash[_deadline_tight_nodeids]
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -65,50 +47,11 @@ def deadline_tolerance() -> float:
 
 
 @pytest.fixture
-def record_deadline(deadline_tolerance: float) -> Callable[[str, float, float], None]:
-    def record(name: str, elapsed: float, budget: float) -> None:
-        bound = budget + deadline_tolerance
-        with Path(
-            f".evidence/sync-deadlines-{sys.version_info.major}.{sys.version_info.minor}.jsonl"
-        ).open("a") as output:
-            output.write(
-                json.dumps(
-                    {
-                        "case": name,
-                        "elapsedSeconds": elapsed,
-                        "budgetSeconds": budget,
-                        "overshootSeconds": max(0.0, elapsed - budget),
-                        "boundSeconds": bound,
-                    }
-                )
-                + "\n"
-            )
-        assert elapsed <= bound
+def sync_clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
+    from chickinfry import _sync_http, _sync_network, session
 
-    return record
-
-
-@pytest.fixture
-def record_phase_deadline() -> Callable[[str, float, float], None]:
-    Path(".evidence").mkdir(exist_ok=True)
-
-    def record(name: str, elapsed: float, budget: float) -> None:
-        bound = budget + 1.0
-        with Path(
-            f".evidence/phase-deadlines-{sys.version_info.major}.{sys.version_info.minor}.jsonl"
-        ).open("a") as output:
-            output.write(
-                json.dumps(
-                    {
-                        "case": name,
-                        "elapsedSeconds": elapsed,
-                        "budgetSeconds": budget,
-                        "overshootSeconds": max(0.0, elapsed - budget),
-                        "boundSeconds": bound,
-                    }
-                )
-                + "\n"
-            )
-        assert elapsed < bound
-
-    return record
+    clock = Clock()
+    # Replace only SDK clocks; the event loop and runner keep their real clocks.
+    for module in (_sync_http, _sync_network, session):
+        monkeypatch.setattr(module, "time", clock)
+    return clock

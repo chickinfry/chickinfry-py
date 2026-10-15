@@ -1,16 +1,18 @@
 import asyncio
 import threading
 import time
-from collections.abc import Callable, Coroutine, Generator
+from collections.abc import Coroutine, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import Context
 from dataclasses import asdict
 from typing import TypeVar, cast
 
+import httpx
 import pytest
 
 from chickinfry import HTTP, AsyncHTTP, ClientError, OperationError, SessionStore
 
+from .deadline import Clock
 from .peer import Peer, Received, json_bytes, respond
 from .test_session import credentials
 
@@ -239,57 +241,79 @@ async def test_sync_other_thread_login_logout_preserves_generation(
             assert not store._active and not store._sync_flights
 
 
-@pytest.mark.deadline_tight
 async def test_sync_short_waiter_fixed_deadline_does_not_cancel_producer(
-    deadline_tolerance: float, record_deadline: Callable[[str, float, float], None]
+    monkeypatch: pytest.MonkeyPatch, sync_clock: Clock
 ) -> None:
     old, rotated = credentials(), credentials()
-    started, release = asyncio.Event(), asyncio.Event()
+    started, release = threading.Event(), threading.Event()
     refresh_count = 0
 
-    async def handler(request: Received, writer: asyncio.StreamWriter) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
         nonlocal refresh_count
-        if request.path == "/auth.refresh":
+        if request.url.path == "/auth.refresh":
             refresh_count += 1
             started.set()
-            await release.wait()
-            await respond(writer, json_bytes(asdict(rotated)))
-        elif request.headers["authorization"] == "Bearer " + old.access_token:
-            await respond(writer, b'{"error":"invalid_token"}', status=401)
-        else:
-            await respond(writer)
-
-    async with Peer(handler) as peer:
-        with (
-            HTTP(peer.origin, timeout=1) as leader,
-            HTTP(peer.origin, timeout=0.06) as short,
-        ):
-            store = SessionStore(peer.origin, old)
-            first = asyncio.create_task(
-                asyncio.to_thread(leader.with_session(store).invoke, "thing.run", {})
+            assert release.wait(5)
+            return httpx.Response(
+                200, stream=httpx.ByteStream(json_bytes(asdict(rotated)))
             )
-            await asyncio.wait_for(started.wait(), 1)
+        if request.headers["authorization"] == "Bearer " + old.access_token:
+            return httpx.Response(
+                401, stream=httpx.ByteStream(b'{"error":"invalid_token"}')
+            )
+        return httpx.Response(200, stream=httpx.ByteStream(b"{}"))
 
-            async def notify() -> None:
-                while not release.is_set():
-                    with store._locked():
-                        store._condition.notify_all()
-                    await asyncio.sleep(0.01)
+    with (
+        HTTP("http://127.0.0.1", timeout=1) as leader,
+        HTTP("http://127.0.0.1", timeout=0.06) as short,
+    ):
+        for owner in (leader, short):
+            assert owner._client is not None
+            owner._client.close()
+            owner._client = httpx.Client(transport=httpx.MockTransport(handler))
+        store = SessionStore("http://127.0.0.1", old)
+        snapshot = store.credentials()
+        first = asyncio.create_task(
+            asyncio.to_thread(leader.with_session(store).invoke, "thing.run", {})
+        )
+        waits: list[float | None] = []
+        wait = store._condition.wait
+        caller: int | None = None
 
-            notifier = asyncio.create_task(notify())
-            begin = time.monotonic()
+        def wake(timeout: float | None = None) -> bool:
+            if threading.get_ident() != caller:
+                return wait(timeout)
+            waits.append(timeout)
+            assert len(waits) <= 3, "Spurious wakeup restarted the waiter deadline"
+            assert timeout is not None
+            sync_clock.advance(min(0.06, timeout))
+            return True
+
+        def invoke() -> object:
+            nonlocal caller
+            caller = threading.get_ident()
+            return short.with_session(store).invoke("thing.run", {})
+
+        # Real waits only guard thread liveness; all deadline assertions use virtual time.
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            monkeypatch.setattr(store._condition, "wait", wake)
             with pytest.raises(
                 ClientError, check=lambda error: error.reason == "timeout"
             ):
-                await asyncio.to_thread(
-                    short.with_session(store).invoke, "thing.run", {}
-                )
-            record_deadline("whole_call_wait", time.monotonic() - begin, 3 * 0.06)
-            assert store.credentials() is not None
+                await asyncio.to_thread(invoke)
+            assert waits == pytest.approx([0.18, 0.12, 0.06])
+            assert sync_clock.now == pytest.approx(0.18)
+            assert store.credentials() is snapshot
+            assert not first.done()
+            with store._locked():
+                flight = next(iter(store._sync_flights.values()))
+                assert not flight.settled and not flight.producer_done
+        finally:
             release.set()
-            await notifier
-            assert await first == {}
-            assert refresh_count == 1
+            assert await asyncio.wait_for(first, 5) == {}
+        assert refresh_count == 1
+        assert store.credentials() == rotated
 
 
 async def test_sync_keyboard_interrupt_waiter_leaves_other_waiter_running(
@@ -491,69 +515,85 @@ async def test_store_mode_attachment_is_atomic_between_threads() -> None:
         await asynchronous.aclose()
 
 
-@pytest.mark.deadline_tight
 async def test_sync_expired_flight_retains_producer_and_discards_late_success(
-    monkeypatch: pytest.MonkeyPatch,
-    deadline_tolerance: float,
-    record_deadline: Callable[[str, float, float], None],
+    monkeypatch: pytest.MonkeyPatch, sync_clock: Clock
 ) -> None:
     old, rotated, latest = credentials(), credentials(), credentials()
-    got_result = threading.Event()
-    release = threading.Event()
+    got_result, release = threading.Event(), threading.Event()
+    requests: list[str] = []
 
-    async def handler(request: Received, writer: asyncio.StreamWriter) -> None:
-        if request.path == "/auth.refresh":
-            await respond(writer, json_bytes(asdict(rotated)))
-        else:
-            await respond(writer, b'{"error":"invalid_token"}', status=401)
-
-    async with Peer(handler) as peer:
-        with HTTP(peer.origin, timeout=0.20) as owner:
-            store = SessionStore(peer.origin, old)
-            signed = owner.with_session(store)
-            original = owner._attempt
-
-            def delayed(
-                operation: str,
-                body: bytes,
-                token: str | None,
-                deadline: float,
-                *,
-                credentials: bool = False,
-            ) -> object:
-                result = original(
-                    operation, body, token, deadline, credentials=credentials
-                )
-                if operation == "auth.refresh":
-                    got_result.set()
-                    assert release.wait(1)
-                return result
-
-            monkeypatch.setattr(owner, "_attempt", delayed)
-            begin = time.monotonic()
-            call = asyncio.create_task(
-                asyncio.to_thread(signed.invoke, "thing.run", {})
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/auth.refresh":
+            return httpx.Response(
+                200, stream=httpx.ByteStream(json_bytes(asdict(rotated)))
             )
-            assert await asyncio.to_thread(got_result.wait, 1)
+        return httpx.Response(
+            401, stream=httpx.ByteStream(b'{"error":"invalid_token"}')
+        )
+
+    with HTTP("http://127.0.0.1", timeout=0.20) as owner:
+        assert owner._client is not None
+        owner._client.close()
+        owner._client = httpx.Client(transport=httpx.MockTransport(handler))
+        store = SessionStore("http://127.0.0.1", old)
+        snapshot = store.credentials()
+        signed = owner.with_session(store)
+        original = owner._attempt
+        producer: threading.Thread | None = None
+
+        def delayed(
+            operation: str,
+            body: bytes,
+            token: str | None,
+            deadline: float,
+            *,
+            credentials: bool = False,
+        ) -> object:
+            nonlocal producer
+            result = original(operation, body, token, deadline, credentials=credentials)
+            if operation == "auth.refresh":
+                producer = threading.current_thread()
+                got_result.set()
+                assert release.wait(5)
+            return result
+
+        waits: list[float | None] = []
+
+        def wake(timeout: float | None = None) -> bool:
+            assert got_result.wait(5)
+            waits.append(timeout)
+            assert len(waits) <= 4, "Spurious wakeup restarted the flight deadline"
+            assert timeout is not None
+            sync_clock.advance(min(0.05, timeout))
+            return True
+
+        monkeypatch.setattr(owner, "_attempt", delayed)
+        monkeypatch.setattr(store._condition, "wait", wake)
+        call = asyncio.create_task(asyncio.to_thread(signed.invoke, "thing.run", {}))
+        try:
             with pytest.raises(
                 ClientError, check=lambda error: error.reason == "timeout"
             ):
-                await call
-            record_deadline("expired_flight", time.monotonic() - begin, 0.20)
+                await asyncio.wait_for(call, 5)
+            assert waits == pytest.approx([0.20, 0.15, 0.10, 0.05])
+            assert sync_clock.now == pytest.approx(0.20)
             with store._locked():
                 assert len(store._sync_flights) == 1
                 flight = next(iter(store._sync_flights.values()))
                 assert flight.settled and not flight.producer_done
-                producer = flight.thread
+                assert flight.thread is producer
+            assert store.credentials() is snapshot
             await asyncio.to_thread(store.replace, latest)
             changed = store.credentials()
+        finally:
             release.set()
-            assert producer is not None
-            await asyncio.to_thread(producer.join, 1)
-            assert not producer.is_alive()
-            assert store.credentials() is changed
-            assert not store._sync_flights and not store._active
-            assert len(peer.received) == 2
+            if producer is not None:
+                await asyncio.to_thread(producer.join, 5)
+        assert producer is not None and not producer.is_alive()
+        assert store.credentials() is changed
+        assert not store._sync_flights and not store._active
+        assert requests == ["/thing.run", "/auth.refresh"]
 
 
 @pytest.mark.parametrize("old_flight", [False, True])

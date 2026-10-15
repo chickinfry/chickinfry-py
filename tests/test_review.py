@@ -6,13 +6,14 @@ import ssl
 import subprocess
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 
 import httpx
 import pytest
+from typing_extensions import Buffer
 
 from chickinfry import (
     HTTP,
@@ -21,10 +22,12 @@ from chickinfry import (
     OperationError,
     SessionCredentials,
     SessionStore,
+    _sync_network,
 )
 from chickinfry._http_common import _response, _serialize
 from chickinfry.session import _read_credentials
 
+from .deadline import Clock
 from .peer import Peer, Received, json_bytes, respond
 from .test_session import credentials
 
@@ -578,30 +581,33 @@ def test_package_does_not_export_private_conformance_hooks() -> None:
     } == {"_conformance"}
 
 
-@pytest.mark.parametrize(
-    "tier", [pytest.param("tight", marks=pytest.mark.deadline_tight), "mechanism"]
-)
-async def test_sync_read_phase_cannot_outlive_remaining_whole_deadline(
-    tier: str,
-    record_deadline: Callable[[str, float, float], None],
-    record_phase_deadline: Callable[[str, float, float], None],
+def test_sync_read_phase_cannot_outlive_remaining_whole_deadline(
+    monkeypatch: pytest.MonkeyPatch, sync_clock: Clock
 ) -> None:
-    async def handler(request: Received, writer: asyncio.StreamWriter) -> None:
-        await request.reader.read()
+    timeouts: list[float | None] = []
 
-    async with Peer(handler) as peer:
-        with HTTP(peer.origin, timeout=10.0) as owner:
-            deadline = time.monotonic() + 0.20
-            begin = time.monotonic()
-            with pytest.raises(
-                ClientError, check=lambda error: error.reason == "timeout"
-            ):
-                await asyncio.to_thread(
-                    owner._attempt, "thing.run", b"{}", None, deadline
-                )
-            record = record_deadline if tier == "tight" else record_phase_deadline
-            record("short_whole_remaining", time.monotonic() - begin, 0.20)
-            assert len(peer.received) == 1
+    class ObservedSocket(socket.socket):
+        def send(self, data: Buffer, flags: int = 0) -> int:
+            sync_clock.advance(0.05)
+            return memoryview(data).nbytes
+
+        def recv(self, bufsize: int, flags: int = 0) -> bytes:
+            remaining = self.gettimeout()
+            timeouts.append(remaining)
+            assert remaining is not None
+            sync_clock.advance(remaining)
+            raise TimeoutError
+
+    with ObservedSocket() as sock, HTTP("http://127.0.0.1", timeout=10.0) as owner:
+        monkeypatch.setattr(
+            _sync_network._Backend,
+            "connect_tcp",
+            lambda backend, *args, **kwargs: _sync_network._Stream(sock, backend),
+        )
+        with pytest.raises(ClientError, check=lambda error: error.reason == "timeout"):
+            owner._attempt("thing.run", b"{}", None, 0.20)
+        assert timeouts == pytest.approx([0.10])
+        assert sync_clock.now == pytest.approx(0.20)
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])

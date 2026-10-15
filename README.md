@@ -100,13 +100,10 @@ and `python -m pip install --no-deps -e .`. Run `ruff check src tests`,
 The root `requirements.txt` pins only the conformance driver's offline
 dependencies. Runtime installation requirements are defined in `pyproject.toml`.
 
-`pytest -q` runs both deadline tiers, including in CI. On an idle machine,
-`pytest -q -m deadline_tight` checks the measured 0.05-second overshoot bound.
-Do not increase that bound to accommodate competing heavy processes.
-`pytest -q -m "not deadline_tight"` runs the remaining tests, including mechanism
-checks with a phase timeout of at least 10 seconds and a 0.20-second remaining
-deadline. Their wider scheduling margin is not evidence of the tight bound.
-Deadline measurements are written under `.evidence/`.
+`pytest -q` runs the full suite, including in CI. The sync shared-deadline
+regressions use virtual clocks and observe the remaining socket and
+condition-wait timeouts. Real thread waits only guard liveness; they do not
+establish deadline precision.
 
 Install the development dependencies and package before running the full suite:
 

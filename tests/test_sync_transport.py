@@ -5,8 +5,8 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +26,7 @@ from chickinfry import (
 from chickinfry._sync_network import _Transport
 from chickinfry.wire import read_record, read_string
 
+from .deadline import Clock
 from .peer import Peer, Received, respond
 from .test_session import credentials
 
@@ -207,145 +208,160 @@ async def test_sync_utf8_request_boundary_before_network() -> None:
             assert len(peer.received) == 1 and len(peer.received[0].body) == limit
 
 
-@pytest.mark.parametrize(
-    "kind", ["headers", "informational", "chunks", "chunk_metadata"]
-)
-@pytest.mark.parametrize(
-    "tier", [pytest.param("tight", marks=pytest.mark.deadline_tight), "mechanism"]
-)
-async def test_sync_repeated_reads_keep_one_deadline(
-    kind: str,
-    tier: str,
-    deadline_tolerance: float,
-    record_deadline: Callable[[str, float, float], None],
-    record_phase_deadline: Callable[[str, float, float], None],
-) -> None:
+async def test_sync_real_clock_timeout_sanity() -> None:
     disconnected = asyncio.Event()
 
     async def handler(request: Received, writer: asyncio.StreamWriter) -> None:
-        if kind == "headers":
-            writer.write(b"HTTP/1.1 200 OK\r\nX-Slow: ")
-        elif kind in {"chunks", "chunk_metadata"}:
-            writer.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
-            if kind == "chunk_metadata":
-                writer.write(b"1;ext=")
-        await writer.drain()
-
-        async def trickle() -> None:
-            while True:
-                data = (
-                    b"HTTP/1.1 100 Continue\r\n\r\n"
-                    if kind == "informational"
-                    else b"1\r\na\r\n"
-                    if kind == "chunks"
-                    else b"x"
-                )
-                writer.write(data)
-                await writer.drain()
-                await asyncio.sleep(0.02)
-
-        sender = asyncio.create_task(trickle())
         try:
-            try:
-                await request.reader.read()
-            except ConnectionError:
-                pass
-            disconnected.set()
-        finally:
-            sender.cancel()
-            await asyncio.gather(sender, return_exceptions=True)
-
-    async with Peer(handler) as peer:
-        with HTTP(peer.origin, timeout=0.20 if tier == "tight" else 10.0) as owner:
-            begin = time.monotonic()
-            with pytest.raises(
-                ClientError, check=lambda error: error.reason == "timeout"
-            ):
-                if tier == "tight":
-                    await asyncio.to_thread(owner.invoke, "thing.run", {})
-                else:
-                    await asyncio.to_thread(
-                        owner._attempt, "thing.run", b"{}", None, begin + 0.20
-                    )
-            elapsed = time.monotonic() - begin
-            record = record_deadline if tier == "tight" else record_phase_deadline
-            record(kind, elapsed, 0.20)
-            await asyncio.wait_for(disconnected.wait(), 1)
-            assert len(peer.received) == 1
-
-
-@pytest.mark.deadline_tight
-async def test_sync_tls_handshake_deadline(
-    deadline_tolerance: float, record_deadline: Callable[[str, float, float], None]
-) -> None:
-    disconnected = asyncio.Event()
-    accepts = 0
-
-    async def raw(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        nonlocal accepts
-        accepts += 1
-        try:
-            await reader.read()
+            await request.reader.read()
         except ConnectionError:
             pass
         disconnected.set()
 
-    async def unused(request: Received, writer: asyncio.StreamWriter) -> None:
-        raise AssertionError
-
-    async with Peer(unused, raw_handler=raw) as peer:
-        with HTTP(peer.origin.replace("http://", "https://", 1), timeout=0.20) as owner:
-            begin = time.monotonic()
-            with pytest.raises(
-                ClientError, check=lambda error: error.reason == "timeout"
-            ):
-                await asyncio.to_thread(owner.invoke, "thing.run", {})
-            record_deadline("tls_handshake", time.monotonic() - begin, 0.20)
-            await asyncio.wait_for(disconnected.wait(), 1)
-            assert accepts == 1 and not peer.received
-
-
-@pytest.mark.deadline_tight
-async def test_sync_pool_admission_deadline(
-    deadline_tolerance: float, record_deadline: Callable[[str, float, float], None]
-) -> None:
-    started, release = asyncio.Event(), asyncio.Event()
-
-    async def handler(request: Received, writer: asyncio.StreamWriter) -> None:
-        started.set()
-        await release.wait()
-        await respond(writer)
-
     async with Peer(handler) as peer:
-        with (
-            HTTP(peer.origin, timeout=1.0) as holder,
-            HTTP(peer.origin, timeout=0.20) as owner,
-        ):
-            assert owner._client is not None
-            assert holder._client is not None
-            owner._client.close()
-            holder._client.close()
-            holder._client = owner._client = httpx.Client(
-                transport=_Transport(max_connections=1), trust_env=False, timeout=1.0
-            )
-            first = asyncio.create_task(
-                asyncio.to_thread(holder.invoke, "thing.run", {})
-            )
-            await asyncio.wait_for(started.wait(), 1)
+        with HTTP(peer.origin, timeout=1.0) as owner:
             begin = time.monotonic()
             with pytest.raises(
                 ClientError, check=lambda error: error.reason == "timeout"
             ):
-                await asyncio.to_thread(owner.invoke, "thing.run", {})
-            record_deadline("pool_admission", time.monotonic() - begin, 0.20)
-            assert not first.done()
+                await asyncio.wait_for(
+                    asyncio.to_thread(owner.invoke, "thing.run", {}), 20
+                )
+            # Coarse real-clock sanity only; virtual-clock tests prove precise budgets.
+            assert 0.5 <= time.monotonic() - begin < 20
+            await asyncio.wait_for(disconnected.wait(), 20)
             assert len(peer.received) == 1
-            with pytest.raises(
-                ClientError, check=lambda error: error.reason == "timeout"
-            ):
-                await first
-            release.set()
-            assert len(peer.received) == 1
+
+
+@pytest.mark.parametrize(
+    "kind", ["headers", "informational", "chunks", "chunk_metadata"]
+)
+@pytest.mark.parametrize("tier", ["request", "whole"])
+def test_sync_repeated_reads_keep_one_deadline(
+    kind: str,
+    tier: str,
+    monkeypatch: pytest.MonkeyPatch,
+    sync_clock: Clock,
+) -> None:
+    timeouts: list[float | None] = []
+    prefix = {
+        "headers": b"HTTP/1.1 200 OK\r\nX-Slow: ",
+        "informational": b"HTTP/1.1 100 Continue\r\n\r\n",
+        "chunks": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "chunk_metadata": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;ext=",
+    }
+    fragment = {
+        "headers": b"x",
+        "informational": b"HTTP/1.1 100 Continue\r\n\r\n",
+        "chunks": b"1\r\na\r\n",
+        "chunk_metadata": b"x",
+    }
+
+    class ObservedSocket(socket.socket):
+        def send(self, data: Buffer, flags: int = 0) -> int:
+            return memoryview(data).nbytes
+
+        def recv(self, bufsize: int, flags: int = 0) -> bytes:
+            timeouts.append(self.gettimeout())
+            assert len(timeouts) <= 4, "Read restarted the deadline"
+            sync_clock.advance(0.05)
+            return prefix[kind] if len(timeouts) == 1 else fragment[kind]
+
+    with (
+        ObservedSocket() as sock,
+        HTTP("http://127.0.0.1", timeout=0.20 if tier == "request" else 10.0) as owner,
+    ):
+        monkeypatch.setattr(
+            _sync_network._Backend,
+            "connect_tcp",
+            lambda backend, *args, **kwargs: _sync_network._Stream(sock, backend),
+        )
+        with pytest.raises(ClientError, check=lambda error: error.reason == "timeout"):
+            if tier == "request":
+                owner.invoke("thing.run", {})
+            else:
+                owner._attempt("thing.run", b"{}", None, 0.20)
+        assert timeouts == pytest.approx([0.20, 0.15, 0.10, 0.05])
+        assert sync_clock.now == pytest.approx(0.20)
+
+
+def test_sync_tls_handshake_deadline(
+    monkeypatch: pytest.MonkeyPatch, sync_clock: Clock
+) -> None:
+    wrapped: list[float | None] = []
+    handshakes: list[float | None] = []
+
+    class ObservedSocket(socket.socket):
+        def do_handshake(self) -> None:
+            remaining = self.gettimeout()
+            handshakes.append(remaining)
+            assert remaining is not None
+            sync_clock.advance(remaining)
+            # A late successful handshake must still be rejected at the deadline.
+
+    def connect(
+        backend: _sync_network._Backend, *args: object, **kwargs: object
+    ) -> _sync_network._Stream:
+        sync_clock.advance(0.05)
+        return _sync_network._Stream(sock, backend)
+
+    def wrap(
+        context: ssl.SSLContext, raw: socket.socket, **kwargs: object
+    ) -> socket.socket:
+        wrapped.append(raw.gettimeout())
+        sync_clock.advance(0.05)
+        return raw
+
+    with ObservedSocket() as sock, HTTP("https://127.0.0.1", timeout=0.20) as owner:
+        monkeypatch.setattr(_sync_network._Backend, "connect_tcp", connect)
+        monkeypatch.setattr(ssl.SSLContext, "wrap_socket", wrap)
+        with pytest.raises(ClientError, check=lambda error: error.reason == "timeout"):
+            owner.invoke("thing.run", {})
+        assert wrapped == pytest.approx([0.15])
+        assert handshakes == pytest.approx([0.10])
+        assert sync_clock.now == pytest.approx(0.20)
+        assert sock.fileno() == -1
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+def test_sync_pool_admission_deadline(
+    admitted: bool, monkeypatch: pytest.MonkeyPatch, sync_clock: Clock
+) -> None:
+    timeouts: list[float | None] = []
+    releases: list[bool] = []
+
+    class ObservedSlots(threading.BoundedSemaphore):
+        def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+            timeouts.append(timeout)
+            assert timeout is not None
+            sync_clock.advance(timeout)
+            return admitted
+
+        def release(self, n: int = 1) -> None:
+            releases.append(True)
+
+    with HTTP("http://127.0.0.1", timeout=0.20) as owner:
+        assert owner._client is not None
+        owner._client.close()
+        transport = _Transport(max_connections=1)
+        transport._slots = ObservedSlots(1)
+        owner._client = httpx.Client(transport=transport, trust_env=False, timeout=0.20)
+        original = owner._http_client
+
+        def client(deadline: float | None = None) -> httpx.Client:
+            sync_clock.advance(0.05)
+            return original(deadline)
+
+        def unexpected_connect(*args: object, **kwargs: object) -> None:
+            pytest.fail("Expired pool admission started network I/O")
+
+        monkeypatch.setattr(owner, "_http_client", client)
+        monkeypatch.setattr(transport._backend, "connect_tcp", unexpected_connect)
+        with pytest.raises(ClientError, check=lambda error: error.reason == "timeout"):
+            owner.invoke("thing.run", {})
+        assert timeouts == pytest.approx([0.15])
+        assert sync_clock.now == pytest.approx(0.20)
+        assert releases == ([True] if admitted else [])
 
 
 def test_sync_partial_writes_keep_one_deadline(
@@ -441,37 +457,40 @@ assert 'httpx' not in sys.modules and 'httpcore' not in sys.modules
     )
 
 
-@pytest.mark.deadline_tight
-async def test_sync_each_failed_address_uses_remaining_budget(
-    monkeypatch: pytest.MonkeyPatch,
-    deadline_tolerance: float,
-    record_deadline: Callable[[str, float, float], None],
+def test_sync_each_failed_address_uses_remaining_budget(
+    monkeypatch: pytest.MonkeyPatch, sync_clock: Clock
 ) -> None:
-    async def handler(request: Received, writer: asyncio.StreamWriter) -> None:
-        await respond(writer)
+    timeouts: list[float | None] = []
+    sockets: list[socket.socket] = []
+    addresses = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 1))] * 8
 
-    with socket.socket() as reserved:
-        reserved.bind(("127.0.0.1", 0))
-        refused_port = reserved.getsockname()[1]
-        async with Peer(handler) as peer:
-            negative = socket.getaddrinfo(
-                "127.0.0.1", refused_port, 0, socket.SOCK_STREAM
-            )[0]
-            final = socket.getaddrinfo(
-                "127.0.0.1", int(peer.origin.rsplit(":", 1)[1]), 0, socket.SOCK_STREAM
-            )[0]
-            addresses = [negative] * 200_000 + [final]
-            with HTTP(peer.origin, timeout=0.20) as owner:
-                monkeypatch.setattr(
-                    socket, "getaddrinfo", lambda *args, **kwargs: addresses
+    class ObservedSocket(socket.socket):
+        def connect(self, address: object) -> None:
+            sockets.append(self)
+            timeouts.append(self.gettimeout())
+            assert len(timeouts) <= 4, "Address retry restarted the deadline"
+            sync_clock.advance(0.05)
+            raise ConnectionRefusedError
+
+    with HTTP("http://127.0.0.1", timeout=0.20) as owner:
+        monkeypatch.setattr(
+            _sync_network,
+            "socket",
+            SimpleNamespace(
+                **(
+                    vars(socket)
+                    | {
+                        "socket": ObservedSocket,
+                        "getaddrinfo": lambda *args, **kwargs: addresses,
+                    }
                 )
-                begin = time.monotonic()
-                with pytest.raises(
-                    ClientError, check=lambda error: error.reason == "timeout"
-                ):
-                    await asyncio.to_thread(owner.invoke, "thing.run", {})
-                record_deadline("failed_addresses", time.monotonic() - begin, 0.20)
-                assert not peer.received
+            ),
+        )
+        with pytest.raises(ClientError, check=lambda error: error.reason == "timeout"):
+            owner.invoke("thing.run", {})
+        assert timeouts == pytest.approx([0.20, 0.15, 0.10, 0.05])
+        assert sync_clock.now == pytest.approx(0.20)
+        assert len(sockets) == 4 and all(sock.fileno() == -1 for sock in sockets)
 
 
 async def test_sync_malformed_network_error_hides_raw_exception() -> None:
