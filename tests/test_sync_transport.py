@@ -9,12 +9,20 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from typing_extensions import Buffer
 
-from chickinfry import HTTP, ClientError, OperationError, SessionStore
+from chickinfry import (
+    HTTP,
+    ClientError,
+    OperationError,
+    SessionStore,
+    _sync_http,
+    _sync_network,
+)
 from chickinfry._sync_network import _Transport
 from chickinfry.wire import read_record, read_string
 
@@ -340,66 +348,41 @@ async def test_sync_pool_admission_deadline(
             assert len(peer.received) == 1
 
 
-@pytest.mark.deadline_tight
-async def test_sync_partial_writes_keep_one_deadline(
+def test_sync_partial_writes_keep_one_deadline(
     monkeypatch: pytest.MonkeyPatch,
-    deadline_tolerance: float,
-    record_deadline: Callable[[str, float, float], None],
 ) -> None:
-    drain, disconnected = asyncio.Event(), asyncio.Event()
-    accepts = 0
+    now = 0.0
+    timeouts: list[float | None] = []
     partial: list[bool] = []
 
-    async def raw(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        nonlocal accepts
-        accepts += 1
-        try:
-            while not drain.is_set():
-                if not await reader.read(4096):
-                    break
-                await asyncio.sleep(0.02)
-            await reader.read()
-        except ConnectionError:
-            pass
-        disconnected.set()
+    class ObservedSocket(socket.socket):
+        def send(self, data: Buffer, flags: int = 0) -> int:
+            nonlocal now
+            timeouts.append(self.gettimeout())
+            size = memoryview(data).nbytes
+            count = min(8, size) if partial else size
+            partial.append(count < size)
+            now += 0.05
+            return count
 
-    async def unused(request: Received, writer: asyncio.StreamWriter) -> None:
-        raise AssertionError
-
-    async with Peer(unused, raw_handler=raw) as peer:
-        port = int(peer.origin.rsplit(":", 1)[1])
-
-        class ObservedSocket(socket.socket):
-            def __init__(
-                self,
-                family: int = socket.AF_INET,
-                type: int = socket.SOCK_STREAM,
-                proto: int = 0,
-                fileno: int | None = None,
-            ) -> None:
-                super().__init__(family, type, proto, fileno)
-                if fileno is None and family in {socket.AF_INET, socket.AF_INET6}:
-                    self.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
-
-            def send(self, data: Buffer, flags: int = 0) -> int:
-                count = super().send(data, flags)
-                if self.getpeername()[1] == port:
-                    partial.append(count < memoryview(data).nbytes)
-                return count
-
-        with HTTP(peer.origin, timeout=0.20) as owner:
-            monkeypatch.setattr(socket, "socket", ObservedSocket)
-            begin = time.monotonic()
+    with ObservedSocket() as sock:
+        with HTTP("http://127.0.0.1", timeout=0.20) as owner:
+            # Only transport clocks advance; runner scheduling cannot consume the budget.
+            clock = SimpleNamespace(monotonic=lambda: now)
+            monkeypatch.setattr(_sync_http, "time", clock)
+            monkeypatch.setattr(_sync_network, "time", clock)
+            monkeypatch.setattr(
+                _sync_network._Backend,
+                "connect_tcp",
+                lambda backend, *args, **kwargs: _sync_network._Stream(sock, backend),
+            )
             with pytest.raises(
                 ClientError, check=lambda error: error.reason == "timeout"
             ):
-                await asyncio.to_thread(
-                    owner.invoke, "thing.run", {"text": "a" * (4 * 1024 * 1024 - 11)}
-                )
-            record_deadline("partial_writes", time.monotonic() - begin, 0.20)
-            assert any(partial) and accepts == 1
-            drain.set()
-            await asyncio.wait_for(disconnected.wait(), 1)
+                owner.invoke("thing.run", {"text": "a" * 32})
+            assert timeouts == pytest.approx([0.20, 0.15, 0.10, 0.05])
+            assert partial == [False, True, True, True]
+            assert now == pytest.approx(0.20)
 
 
 async def test_sync_concurrent_init_close_interrupts_io_and_rejects_copies() -> None:
