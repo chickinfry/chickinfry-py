@@ -2,17 +2,20 @@ import asyncio
 import json
 import sys
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import TypeVar
 from uuid import UUID
 
+import pytest
+
 from chickinfry._auth_database import Database as PrivateDatabase
 from chickinfry._auth_database import create_database
 from chickinfry.auth import Auth, CleanupContext, hash_token, random_token
-from chickinfry.orm import DatabasePort, format_timestamp
+from chickinfry.orm import DatabasePort, format_timestamp, parse_timestamp
 from chickinfry.postgres import PostgresPort
+from chickinfry.server import ServerError
 
 from .server_fixture import Harness
 
@@ -30,6 +33,7 @@ class PassCounts:
     auth_zero_rows: int = 0
     invite_zero_rows: int = 0
     closed: bool = False
+    candidates: list[str] = field(default_factory=list)
 
 
 class CountingPort:
@@ -50,6 +54,8 @@ class CountingPort:
             else:
                 self.counts.auth_attempts += 1
         rows = await self.delegate.query(sql, parameters)
+        if sql.startswith("select ") and 'from "public"."app_auth_sessions"' in sql:
+            self.counts.candidates.extend(str(row["id"]) for row in rows)
         if deleting:
             if invite:
                 self.counts.invite_deleted += len(rows)
@@ -89,6 +95,7 @@ async def test_cleanup_attempt_bounds_include_zero_row_deletes(db: Harness) -> N
                 "token_hash": hash_token(random_token()),
                 "user_session_version": 1,
                 "expires_at": old,
+                "created_at": old,
             }
         )
         await private.refresh_tokens.insert(
@@ -97,6 +104,7 @@ async def test_cleanup_attempt_bounds_include_zero_row_deletes(db: Harness) -> N
                 "session_id": session.id,
                 "token_hash": "veto" if i == 0 else hash_token(random_token()),
                 "expires_at": old,
+                "created_at": old,
             }
         )
         await private.rate_limits.insert(
@@ -193,3 +201,340 @@ async def test_cleanup_attempt_bounds_include_zero_row_deletes(db: Harness) -> N
             }
         )
     )
+
+
+async def test_cleanup_progress_past_preserved_credentials_and_legacy_families(
+    db: Harness,
+) -> None:
+    """M12/CLEANUP-SEL: detect credential-capped starvation or lost replay links."""
+    core = Auth(db.port(), create_database, now=db.now)
+    initial = await core.signup("progress@example.test", "a long cleanup test password")
+    started = db.now()
+    private = PrivateDatabase(db.port())
+    db.instant += timedelta(days=29)
+    current = await core.refresh(initial.refresh_token)
+    for _ in range(100):
+        await private.refresh_tokens.insert(
+            {
+                "session_id": initial.session_id,
+                "token_hash": hash_token(random_token()),
+                "created_at": format_timestamp(started),
+                "consumed_at": format_timestamp(db.now()),
+                "expires_at": initial.refresh_expires_at,
+            }
+        )
+    dead: list[str] = []
+    for i in range(70):
+        row = await private.sessions.insert(
+            {
+                "user_id": initial.user_id,
+                "token_hash": hash_token(random_token()),
+                "user_session_version": 1,
+                "created_at": format_timestamp(started),
+                "expires_at": format_timestamp(started + timedelta(seconds=900)),
+                "first_login_at": None if i % 2 else format_timestamp(started),
+                "last_renewed_at": None if i % 2 else format_timestamp(started),
+            }
+        )
+        dead.append(row.id)
+        await private.refresh_tokens.insert(
+            {
+                "session_id": row.id,
+                "token_hash": hash_token(random_token()),
+                "created_at": format_timestamp(started),
+                "expires_at": format_timestamp(
+                    started + timedelta(days=7 if i % 2 else 30)
+                ),
+            }
+        )
+    tasks: list[asyncio.Task[None]] = []
+    counts: list[PassCounts] = []
+
+    def create_port() -> CountingPort:
+        tally = PassCounts()
+        counts.append(tally)
+        port = db.port()
+        return CountingPort(port, port, tally)
+
+    def schedule(work: Coroutine[None, None, None]) -> None:
+        tasks.append(asyncio.create_task(work))
+
+    core.cleanup_context = CleanupContext(create_port, schedule)
+    db.instant = started + timedelta(days=31)
+    newest = await core.refresh(current.refresh_token)
+    await asyncio.gather(*tasks)
+    for _ in range(3):
+        core._schedule_cleanup()
+        await asyncio.gather(*tasks)
+    for tally in counts:
+        assert (
+            tally.closed and tally.auth_attempts <= 96 and tally.invite_attempts <= 32
+        )
+        assert initial.session_id not in tally.candidates
+    assert sum(tally.auth_deleted for tally in counts) >= 140
+    survivors = await private.sessions.find_many()
+    assert len(survivors) == 1 and survivors[0].id == initial.session_id
+    assert not any(row.id in dead for row in survivors)
+    assert len(await private.refresh_tokens.find_many()) == 103
+    with pytest.raises(ServerError) as reused:
+        await core.refresh(initial.refresh_token)
+    assert reused.value.code == "session_revoked"
+    with pytest.raises(ServerError):
+        await core.session(newest.access_token)
+    with pytest.raises(ServerError):
+        await core.refresh(newest.refresh_token)
+
+
+async def test_cleanup_growth_rejects_expired_refresh_and_eventually_selects_family(
+    db: Harness,
+) -> None:
+    """CLEANUP-GROW (a): catch stored-expiry revival or never selecting delayed cleanup."""
+    core = Auth(db.port(), create_database, now=db.now, idle_timeout_seconds=3600)
+    password = "a long cleanup test password"
+    initial = await core.signup("growth@example.test", password)
+    probe = await core.signin("growth@example.test", password)
+    started = db.now()
+    private = PrivateDatabase(db.port())
+    grown = Auth(db.port(), create_database, now=db.now, idle_timeout_seconds=7200)
+    db.instant = started + timedelta(seconds=3600, microseconds=1)
+    with pytest.raises(ServerError) as expired:
+        await grown.refresh(probe.refresh_token)
+    assert expired.value.status == 401 and expired.value.code == "session_revoked"
+    # The rejection revokes its probe; keep the untouched family for candidate checks.
+    root = db.port()
+    for instant in (db.now(), started + timedelta(seconds=7200, microseconds=-1)):
+        db.instant = instant
+        tally = PassCounts()
+        await grown._cleanup(CountingPort(root, root, tally), False)
+        assert initial.session_id not in tally.candidates
+        assert await private.sessions.find_by_id({"id": initial.session_id}) is not None
+    db.instant = started + timedelta(seconds=7200)
+    tally = PassCounts()
+    await grown._cleanup(CountingPort(root, root, tally), False)
+    assert initial.session_id in tally.candidates and tally.auth_deleted == 2
+    assert await private.sessions.find_by_id({"id": initial.session_id}) is None
+    assert not await private.refresh_tokens.find_many()
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["modern", "legacy"])
+async def test_cleanup_shrink_progress_past_full_candidate_batch(
+    db: Harness, legacy: bool
+) -> None:
+    """CLEANUP-GROW (b): catch policy bypass or starvation beyond the current idle."""
+    core = Auth(db.port(), create_database, now=db.now)
+    owner = await core.signup("shrink@example.test", "a long cleanup test password")
+    private = PrivateDatabase(db.port())
+    started = db.now()
+    issued = started - timedelta(minutes=30) if legacy else started
+    access_expiry = (
+        started - timedelta(hours=2) if legacy else issued + timedelta(seconds=900)
+    )
+    stored_expiry = format_timestamp(started + timedelta(days=6))
+    blockers: list[str] = []
+    for i in range(32):
+        values = {
+            "created_at": format_timestamp(
+                started - timedelta(days=1) if legacy else started
+            ),
+            "expires_at": format_timestamp(access_expiry),
+            "first_login_at": None if legacy else format_timestamp(started),
+            "last_renewed_at": None if legacy else format_timestamp(issued),
+        }
+        if i == 0:
+            row = await private.sessions.update({"id": owner.session_id}, values)
+            assert row is not None
+            refresh = (await private.refresh_tokens.find_many())[0]
+            await private.refresh_tokens.update(
+                {"id": refresh.id},
+                {"created_at": format_timestamp(issued), "expires_at": stored_expiry},
+            )
+        else:
+            row = await private.sessions.insert(
+                {
+                    **values,
+                    "user_id": owner.user_id,
+                    "token_hash": hash_token(random_token()),
+                    "user_session_version": 1,
+                }
+            )
+            await private.refresh_tokens.insert(
+                {
+                    "session_id": row.id,
+                    "token_hash": hash_token(random_token()),
+                    "created_at": format_timestamp(issued),
+                    "expires_at": stored_expiry,
+                }
+            )
+        blockers.append(row.id)
+    dead: list[str] = []
+    dead_issued = (
+        started - timedelta(minutes=90) if legacy else started + timedelta(seconds=1)
+    )
+    for _ in range(2):
+        row = await private.sessions.insert(
+            {
+                "user_id": owner.user_id,
+                "token_hash": hash_token(random_token()),
+                "user_session_version": 1,
+                "created_at": format_timestamp(dead_issued),
+                "expires_at": format_timestamp(dead_issued + timedelta(seconds=900)),
+                "first_login_at": format_timestamp(dead_issued),
+                "last_renewed_at": format_timestamp(dead_issued),
+            }
+        )
+        dead.append(row.id)
+        await private.refresh_tokens.insert(
+            {
+                "session_id": row.id,
+                "token_hash": hash_token(random_token()),
+                "created_at": format_timestamp(dead_issued),
+                "expires_at": format_timestamp(dead_issued + timedelta(seconds=3600)),
+            }
+        )
+    if not legacy:
+        db.instant = started + timedelta(seconds=7200)
+    shrunk = Auth(db.port(), create_database, now=db.now, idle_timeout_seconds=3600)
+    assert parse_timestamp(stored_expiry) > db.now()
+    if not legacy:
+        with pytest.raises(ServerError) as expired:
+            await shrunk.refresh(owner.refresh_token)
+        assert expired.value.status == 401 and expired.value.code == "session_revoked"
+    root = db.port()
+    if legacy:
+        live = await private.sessions.find_by_id({"id": owner.session_id})
+        assert live is not None
+        expiry = await shrunk._family_expiry(create_database(root), live)
+        assert expiry is not None and expiry > db.now()
+    for attempt in range(4 if legacy else 2):
+        tally = PassCounts()
+        await shrunk._cleanup(CountingPort(root, root, tally), False)
+        assert tally.auth_attempts <= 96
+        if legacy or attempt == 0:
+            assert set(tally.candidates) == set(blockers)
+        if legacy:
+            assert tally.auth_deleted == 0
+            surviving = await private.sessions.find_many()
+            assert all(row.revoked_at is None for row in surviving)
+            assert len(surviving) == 34
+    if legacy:
+        db.instant = issued + timedelta(seconds=3600, microseconds=-1)
+        tally = PassCounts()
+        await shrunk._cleanup(CountingPort(root, root, tally), False)
+        assert set(tally.candidates) == set(blockers)
+        preserved = await private.sessions.find_many()
+        assert len(preserved) == 34 and all(row.revoked_at is None for row in preserved)
+        assert len(await private.refresh_tokens.find_many()) == 34
+        db.instant = issued + timedelta(seconds=3600)
+        with pytest.raises(ServerError) as expired:
+            await shrunk.refresh(owner.refresh_token)
+        assert expired.value.status == 401 and expired.value.code == "session_revoked"
+        for _ in range(2):
+            tally = PassCounts()
+            await shrunk._cleanup(CountingPort(root, root, tally), False)
+            assert tally.auth_attempts <= 96
+    surviving = await private.sessions.find_many()
+    remaining_dead = sum(row.id in dead for row in surviving)
+    assert remaining_dead == 0, (
+        f"Cleanup stalled behind {len(blockers)} candidates: "
+        f"{remaining_dead} dead families remain after the current idle elapsed."
+    )
+    assert not surviving
+    assert not await private.refresh_tokens.find_many()
+
+
+async def test_legacy_cleanup_selection_uses_seven_day_upper_bound(db: Harness) -> None:
+    """CLEANUP-SEL 3: catch removing the legacy created_at < now - 7 days filter."""
+    core = Auth(db.port(), create_database, now=db.now)
+    private = PrivateDatabase(db.port())
+    owner = await private.users.insert({"email": "legacy-upper-bound@example.test"})
+    sessions: list[str] = []
+    refresh_ids: list[str] = []
+    for offset in (-1, 0, 1):
+        created = db.now() - timedelta(days=7) + timedelta(microseconds=offset)
+        session = await private.sessions.insert(
+            {
+                "user_id": owner.id,
+                "token_hash": hash_token(random_token()),
+                "user_session_version": 1,
+                "created_at": format_timestamp(created),
+                "expires_at": format_timestamp(db.now() + timedelta(seconds=900)),
+                "first_login_at": None,
+                "last_renewed_at": None,
+            }
+        )
+        refresh = await private.refresh_tokens.insert(
+            {
+                "session_id": session.id,
+                "token_hash": hash_token(random_token()),
+                "created_at": format_timestamp(created),
+                "expires_at": format_timestamp(created + timedelta(days=7)),
+            }
+        )
+        sessions.append(session.id)
+        refresh_ids.append(refresh.id)
+    tally = PassCounts()
+    root = db.port()
+    await core._cleanup(CountingPort(root, root, tally), False)
+    assert tally.candidates == sessions[:1]
+    assert tally.auth_deleted == 2
+    for index, session_id in enumerate(sessions):
+        session_row = await private.sessions.find_by_id({"id": session_id})
+        refresh_row = await private.refresh_tokens.find_by_id(
+            {"id": refresh_ids[index]}
+        )
+        if index == 0:
+            assert session_row is None and refresh_row is None
+        else:
+            assert session_row is not None and session_row.revoked_at is None
+            assert refresh_row is not None
+
+
+@pytest.mark.parametrize("minutes", [30, 120])
+async def test_legacy_cleanup_selection_uses_safe_issue_bound(
+    db: Harness, minutes: int
+) -> None:
+    """CLEANUP-SEL: detect premature selection, no legacy progress, or early access expiry."""
+    core = Auth(db.port(), create_database, now=db.now, idle_timeout_seconds=3600)
+    tokens = await core.signup(
+        "legacy-cleanup@example.test", "a long cleanup test password"
+    )
+    private = PrivateDatabase(db.port())
+    issued = db.now() - timedelta(minutes=minutes)
+    await private.sessions.update(
+        {"id": tokens.session_id},
+        {
+            "created_at": format_timestamp(db.now() - timedelta(days=1)),
+            "first_login_at": None,
+            "last_renewed_at": None,
+            "expires_at": format_timestamp(issued + timedelta(seconds=900)),
+        },
+    )
+    refresh = (await private.refresh_tokens.find_many())[0]
+    await private.refresh_tokens.update(
+        {"id": refresh.id},
+        {
+            "created_at": format_timestamp(issued),
+            "expires_at": format_timestamp(db.now() + timedelta(days=6)),
+        },
+    )
+    for _ in range(100):
+        await private.refresh_tokens.insert(
+            {
+                "session_id": tokens.session_id,
+                "token_hash": hash_token(random_token()),
+                "created_at": format_timestamp(db.now() - timedelta(days=1)),
+                "consumed_at": format_timestamp(issued),
+                "expires_at": format_timestamp(db.now() + timedelta(days=6)),
+            }
+        )
+    tally = PassCounts()
+    root = db.port()
+    for _ in range(4):
+        await core._cleanup(CountingPort(root, root, tally), False)
+    row = await private.sessions.find_by_id({"id": tokens.session_id})
+    if minutes == 30:
+        assert row is not None and tally.auth_attempts == 0
+        assert tokens.session_id not in tally.candidates
+    else:
+        assert row is None and tally.auth_deleted == 102
+        assert tokens.session_id in tally.candidates

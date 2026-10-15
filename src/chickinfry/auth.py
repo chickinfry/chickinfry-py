@@ -95,6 +95,12 @@ class SessionRecord(Protocol):
     def expires_at(self) -> str: ...
     @property
     def revoked_at(self) -> str | None: ...
+    @property
+    def created_at(self) -> str: ...
+    @property
+    def first_login_at(self) -> str | None: ...
+    @property
+    def last_renewed_at(self) -> str | None: ...
 
 
 class RefreshRecord(Protocol):
@@ -106,6 +112,8 @@ class RefreshRecord(Protocol):
     def expires_at(self) -> str: ...
     @property
     def consumed_at(self) -> str | None: ...
+    @property
+    def created_at(self) -> str: ...
 
 
 class IdentityRecord(Protocol):
@@ -307,10 +315,28 @@ class Auth:
         project_id: str | None = None,
         providers: Sequence[IdentityProvider] = (),
         cleanup: CleanupContext | None = None,
+        idle_timeout_seconds: int = 2592000,
+        absolute_lifetime_seconds: int = 0,
         _kdf: PasswordKDF | None = None,
     ) -> None:
         if signup not in ("open", "invite-only"):
             raise ValueError("Invalid signup policy.")
+        if (
+            type(idle_timeout_seconds) is not int
+            or not 3600 <= idle_timeout_seconds <= 31536000
+        ):
+            raise ValueError(
+                "auth.session.idle_timeout_seconds must be an integer between 3600 and 31536000 seconds"
+            )
+        if type(absolute_lifetime_seconds) is not int or not (
+            absolute_lifetime_seconds == 0
+            or 3600 <= absolute_lifetime_seconds <= 31536000
+        ):
+            raise ValueError(
+                "auth.session.absolute_lifetime_seconds must be 0 (disabled) or an integer between 3600 and 31536000 seconds"
+            )
+        self.idle_timeout_seconds = idle_timeout_seconds
+        self.absolute_lifetime_seconds = absolute_lifetime_seconds
         self.port, self.create_database = port, create_database
         self.db = create_database(port)
         self.now, self.hooks, self.signup_policy, self.project_id = (
@@ -335,10 +361,21 @@ class Auth:
         return format_timestamp(self.now() + timedelta(seconds=seconds))
 
     async def _issue(self, db: AuthDatabase, user: UserRecord) -> Tokens:
+        current = await db.users.update_if(
+            {"id": user.id},
+            and_(
+                _filter(db.users, "disabled_at", "is null"),
+                _filter(db.users, "session_version", "=", user.session_version),
+            ),
+            {"session_version": user.session_version},
+        )
+        if current is None:
+            raise ServerError("invalid_credentials", 401)
         access, refresh = random_token(), random_token()
         issued = self.now()
         expiry = format_timestamp(issued + timedelta(seconds=900))
-        family = format_timestamp(issued + timedelta(seconds=604800))
+        stamp = format_timestamp(issued)
+        family = format_timestamp(self._renewed_expiry(issued, issued))
         session = await db.sessions.insert(
             {
                 "user_id": user.id,
@@ -346,6 +383,9 @@ class Auth:
                 "user_session_version": user.session_version,
                 "expires_at": expiry,
                 "transport": "native",
+                "created_at": stamp,
+                "first_login_at": stamp,
+                "last_renewed_at": stamp,
             }
         )
         await db.refresh_tokens.insert(
@@ -353,9 +393,58 @@ class Auth:
                 "session_id": session.id,
                 "token_hash": hash_token(refresh),
                 "expires_at": family,
+                "created_at": stamp,
             }
         )
         return Tokens(access, refresh, expiry, family, user.id, session.id)
+
+    def _renewed_expiry(self, first: datetime, issued: datetime) -> datetime:
+        idle = issued + timedelta(seconds=self.idle_timeout_seconds)
+        return (
+            min(idle, first + timedelta(seconds=self.absolute_lifetime_seconds))
+            if self.absolute_lifetime_seconds
+            else idle
+        )
+
+    async def _family_expiry(
+        self, db: AuthDatabase, record: SessionRecord
+    ) -> datetime | None:
+        active = await db.refresh_tokens.find_many(
+            where=and_(
+                _filter(db.refresh_tokens, "session_id", "=", record.id),
+                _filter(db.refresh_tokens, "consumed_at", "is null"),
+            ),
+            limit=2,
+        )
+        if len(active) != 1:
+            return None
+        renewed = record.last_renewed_at
+        if renewed is None:
+            latest = await db.refresh_tokens.find_many(
+                where=_filter(db.refresh_tokens, "session_id", "=", record.id),
+                order_by=(
+                    Order(db.refresh_tokens.table.columns["created_at"], "desc"),
+                ),
+                limit=1,
+            )
+            renewed = latest[0].created_at
+        first = parse_timestamp(record.first_login_at or record.created_at)
+        return min(
+            parse_timestamp(active[0].expires_at),
+            self._renewed_expiry(first, parse_timestamp(renewed)),
+        )
+
+    async def _lock_user(
+        self, db: AuthDatabase, record: SessionRecord
+    ) -> UserRecord | None:
+        return await db.users.update_if(
+            {"id": record.user_id},
+            and_(
+                _filter(db.users, "disabled_at", "is null"),
+                _filter(db.users, "session_version", "=", record.user_session_version),
+            ),
+            {"session_version": record.user_session_version},
+        )
 
     async def _creating(self, port: DatabasePort, user: UserRecord) -> AuthUser:
         public = AuthUser(user.id, user.email, user.created_at)
@@ -494,32 +583,54 @@ class Auth:
         self._schedule_cleanup()
         return tokens
 
-    async def _validate_session(self, record: SessionRecord | None) -> Session:
+    async def _validate_session(
+        self, db: AuthDatabase, record: SessionRecord | None
+    ) -> Session:
         if (
             record is None
             or record.transport != "native"
             or record.revoked_at is not None
-            or parse_timestamp(record.expires_at) <= self.now()
         ):
             raise ServerError("invalid_token", 401)
-        user = await self.db.users.find_by_id({"id": record.user_id})
+        user = await self._lock_user(db, record)
+        instant = self.now()
+        family = await self._family_expiry(db, record)
         if (
             user is None
-            or user.disabled_at is not None
-            or user.session_version != record.user_session_version
+            or parse_timestamp(record.expires_at) <= instant
+            or family is None
+            or family <= instant
         ):
             raise ServerError("invalid_token", 401)
         return Session(record.id, User(user.id, user.email))
 
     async def session(self, access_token: str) -> Session:
         _validate_token(access_token)
-        rows = await self.db.sessions.find_many(
-            where=_filter(
-                self.db.sessions, "token_hash", "=", hash_token(access_token)
-            ),
-            limit=1,
+
+        async def read(port: DatabasePort) -> Session:
+            db = self.create_database(port)
+            record = await self._lock_session(db, access_token)
+            return await self._validate_session(db, record)
+
+        return await self.port.transaction(read)
+
+    async def _lock_session(
+        self, db: AuthDatabase, access: str
+    ) -> SessionRecord | None:
+        rows = await db.sessions.find_many(
+            where=_filter(db.sessions, "token_hash", "=", hash_token(access)), limit=1
         )
-        return await self._validate_session(rows[0] if rows else None)
+        if not rows:
+            return None
+        return await db.sessions.update_if(
+            {"id": rows[0].id},
+            and_(
+                _filter(db.sessions, "token_hash", "=", hash_token(access)),
+                _filter(db.sessions, "revoked_at", "is null"),
+                _filter(db.sessions, "transport", "=", "native"),
+            ),
+            {"revoked_at": None},
+        )
 
     async def logout(self, access_token: str) -> None:
         session = await self.session(access_token)
@@ -545,51 +656,61 @@ class Auth:
             db = self.create_database(port)
             session = await db.sessions.update_if(
                 {"id": stored.session_id},
-                _filter(db.sessions, "revoked_at", "is null"),
+                and_(
+                    _filter(db.sessions, "revoked_at", "is null"),
+                    _filter(db.sessions, "transport", "=", "native"),
+                ),
                 {"revoked_at": None},
             )
             if session is None or session.transport != "native":
                 return None
             current = await db.refresh_tokens.find_by_id({"id": stored.id})
-            user = await db.users.find_by_id({"id": session.user_id})
+            user = await self._lock_user(db, session)
+            instant = self.now()
+            stamp = format_timestamp(instant)
+            family = await self._family_expiry(db, session)
             if (
                 current is None
                 or current.consumed_at is not None
-                or parse_timestamp(current.expires_at) <= self.now()
+                or parse_timestamp(current.expires_at) <= instant
                 or user is None
-                or user.disabled_at is not None
-                or user.session_version != session.user_session_version
+                or family is None
+                or family <= instant
             ):
-                await db.sessions.update(
-                    {"id": session.id}, {"revoked_at": self._timestamp()}
-                )
+                await db.sessions.update({"id": session.id}, {"revoked_at": stamp})
                 return None
             consumed = await db.refresh_tokens.update_if(
                 {"id": current.id},
                 _filter(db.refresh_tokens, "consumed_at", "is null"),
-                {"consumed_at": self._timestamp()},
+                {"consumed_at": stamp},
             )
             if consumed is None:
-                await db.sessions.update(
-                    {"id": session.id}, {"revoked_at": self._timestamp()}
-                )
+                await db.sessions.update({"id": session.id}, {"revoked_at": stamp})
                 return None
             access, refresh = random_token(), random_token()
-            expiry = self._timestamp(900)
+            expiry = format_timestamp(instant + timedelta(seconds=900))
+            first = session.first_login_at or session.created_at
+            renewed = format_timestamp(
+                self._renewed_expiry(parse_timestamp(first), instant)
+            )
             await db.sessions.update(
                 {"id": session.id},
-                {"token_hash": hash_token(access), "expires_at": expiry},
+                {
+                    "token_hash": hash_token(access),
+                    "expires_at": expiry,
+                    "first_login_at": first,
+                    "last_renewed_at": stamp,
+                },
             )
             await db.refresh_tokens.insert(
                 {
                     "session_id": session.id,
                     "token_hash": hash_token(refresh),
-                    "expires_at": current.expires_at,
+                    "expires_at": renewed,
+                    "created_at": stamp,
                 }
             )
-            return Tokens(
-                access, refresh, expiry, current.expires_at, user.id, session.id
-            )
+            return Tokens(access, refresh, expiry, renewed, user.id, session.id)
 
         outcome = await self.port.transaction(consume)
         if outcome is None:
@@ -688,37 +809,8 @@ class Auth:
 
         async def run(port: DatabasePort) -> T:
             db = self.create_database(port)
-            rows = await db.sessions.find_many(
-                where=_filter(db.sessions, "token_hash", "=", hash_token(access)),
-                limit=1,
-            )
-            if not rows:
-                raise ServerError("invalid_token", 401)
-            candidate = rows[0]
-            session = await db.sessions.update_if(
-                {"id": candidate.id},
-                and_(
-                    _filter(db.sessions, "token_hash", "=", hash_token(access)),
-                    _filter(db.sessions, "revoked_at", "is null"),
-                    _filter(db.sessions, "transport", "=", "native"),
-                    _filter(db.sessions, "expires_at", ">", self._timestamp()),
-                ),
-                {"expires_at": candidate.expires_at},
-            )
-            if session is None or parse_timestamp(session.expires_at) <= self.now():
-                raise ServerError("invalid_token", 401)
-            user = await db.users.update_if(
-                {"id": session.user_id},
-                and_(
-                    _filter(db.users, "disabled_at", "is null"),
-                    _filter(
-                        db.users, "session_version", "=", session.user_session_version
-                    ),
-                ),
-                {"session_version": session.user_session_version},
-            )
-            if user is None:
-                raise ServerError("invalid_token", 401)
+            session = await self._lock_session(db, access)
+            actor = await self._validate_session(db, session)
             if self.hooks.invite_managing is None:
                 raise ServerError("permission_denied", 403)
             if self.project_id is None:
@@ -727,7 +819,6 @@ class Auth:
                 project = _invite_id(self.project_id)
             except ServerError:
                 raise ServerError("service_unavailable", 503) from None
-            actor = Session(session.id, User(user.id, user.email))
             try:
                 await self.hooks.invite_managing(port, actor, project)
             except ServerError:
@@ -919,63 +1010,99 @@ class Auth:
         stage = "refresh"
         try:
             if not invites_only:
-                refresh = await db.refresh_tokens.find_many(
-                    where=_filter(db.refresh_tokens, "expires_at", "<=", cutoff),
-                    limit=32,
-                    order_by=(
-                        Order(db.refresh_tokens.table.columns["expires_at"], "asc"),
-                        Order(db.refresh_tokens.table.columns["id"], "asc"),
-                    ),
+                instant = parse_timestamp(cutoff)
+                idle_cutoff = format_timestamp(
+                    instant - timedelta(seconds=self.idle_timeout_seconds)
                 )
-                for row in refresh:
-
-                    async def delete_refresh(
-                        tx_port: DatabasePort, candidate: RefreshRecord = row
-                    ) -> None:
-                        tx = self.create_database(tx_port)
-                        locked = await tx.refresh_tokens.update_if(
-                            {"id": candidate.id},
-                            and_(
-                                _filter(
-                                    tx.refresh_tokens,
-                                    "expires_at",
-                                    "=",
-                                    candidate.expires_at,
-                                ),
-                                _filter(tx.refresh_tokens, "expires_at", "<=", cutoff),
+                candidates = [
+                    _filter(db.sessions, "revoked_at", "is not null"),
+                    and_(
+                        _filter(db.sessions, "last_renewed_at", "is not null"),
+                        _filter(db.sessions, "last_renewed_at", "<=", idle_cutoff),
+                    ),
+                    and_(
+                        _filter(db.sessions, "last_renewed_at", "is null"),
+                        or_(
+                            _filter(db.sessions, "expires_at", "<=", idle_cutoff),
+                            _filter(
+                                db.sessions,
+                                "created_at",
+                                "<",
+                                format_timestamp(instant - timedelta(days=7)),
                             ),
-                            {"expires_at": candidate.expires_at},
+                        ),
+                    ),
+                ]
+                if self.absolute_lifetime_seconds:
+                    absolute_cutoff = format_timestamp(
+                        instant - timedelta(seconds=self.absolute_lifetime_seconds)
+                    )
+                    candidates.append(
+                        or_(
+                            _filter(
+                                db.sessions, "first_login_at", "<=", absolute_cutoff
+                            ),
+                            and_(
+                                _filter(db.sessions, "first_login_at", "is null"),
+                                _filter(
+                                    db.sessions, "created_at", "<=", absolute_cutoff
+                                ),
+                            ),
                         )
-                        if locked is not None:
-                            await tx.refresh_tokens.delete({"id": locked.id})
-
-                    await port.transaction(delete_refresh)
-                stage = "session"
+                    )
                 sessions = await db.sessions.find_many(
-                    where=_filter(db.sessions, "expires_at", "<=", cutoff),
+                    where=and_(
+                        _filter(db.sessions, "transport", "=", "native"),
+                        or_(*candidates),
+                    ),
                     limit=32,
                     order_by=(
                         Order(db.sessions.table.columns["expires_at"], "asc"),
                         Order(db.sessions.table.columns["id"], "asc"),
                     ),
                 )
+                refresh_attempts = 0
                 for session in sessions:
 
-                    async def delete_session(
+                    async def delete_family(
                         tx_port: DatabasePort, candidate: SessionRecord = session
                     ) -> None:
+                        nonlocal refresh_attempts
                         tx = self.create_database(tx_port)
                         locked = await tx.sessions.update_if(
                             {"id": candidate.id},
-                            and_(
-                                _filter(
-                                    tx.sessions, "expires_at", "=", candidate.expires_at
-                                ),
-                                _filter(tx.sessions, "expires_at", "<=", cutoff),
-                            ),
-                            {"expires_at": candidate.expires_at},
+                            _filter(tx.sessions, "transport", "=", "native"),
+                            {"transport": "native"},
                         )
-                        if locked is not None and not await tx.refresh_tokens.find_many(
+                        if locked is None:
+                            return
+                        checked = self.now()
+                        if locked.revoked_at is None:
+                            family = await self._family_expiry(tx, locked)
+                            if family is None or family > checked:
+                                return
+                            await tx.sessions.update(
+                                {"id": locked.id},
+                                {"revoked_at": format_timestamp(checked)},
+                            )
+                        if refresh_attempts < 32:
+                            refresh = await tx.refresh_tokens.find_many(
+                                where=_filter(
+                                    tx.refresh_tokens, "session_id", "=", locked.id
+                                ),
+                                limit=32 - refresh_attempts,
+                                order_by=(
+                                    Order(
+                                        tx.refresh_tokens.table.columns["created_at"],
+                                        "asc",
+                                    ),
+                                    Order(tx.refresh_tokens.table.columns["id"], "asc"),
+                                ),
+                            )
+                            for row in refresh:
+                                refresh_attempts += 1
+                                await tx.refresh_tokens.delete({"id": row.id})
+                        if not await tx.refresh_tokens.find_many(
                             where=_filter(
                                 tx.refresh_tokens, "session_id", "=", locked.id
                             ),
@@ -983,7 +1110,7 @@ class Auth:
                         ):
                             await tx.sessions.delete({"id": locked.id})
 
-                    await port.transaction(delete_session)
+                    await port.transaction(delete_family)
                 stage = "rate_limit"
                 limits = await db.rate_limits.find_many(
                     where=_filter(db.rate_limits, "expires_at", "<=", cutoff),

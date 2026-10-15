@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from chickinfry._auth_database import create_database
+from chickinfry.auth import Auth
 from chickinfry.errors import OperationError
 from chickinfry.server import (
     Application,
@@ -204,6 +206,7 @@ async def test_error_boundary(failure: Exception, status: int, code: str) -> Non
     assert response.status == status and json.loads(response.body) == {"error": code}
     assert probe.opened == probe.closed == 1
     assert response.headers["Cache-Control"] == "no-store"
+    assert not any(name.lower() == "set-cookie" for name in response.headers)
 
 
 async def test_routes_cors_and_auth_before_handler() -> None:
@@ -243,6 +246,10 @@ async def test_routes_cors_and_auth_before_handler() -> None:
         )
     )
     assert invalid.status == 401 and probe.calls == 0
+    assert not any(name.lower() == "set-cookie" for name in invalid.headers)
+    success = await app.fetch(BytesRequest([b'{"wire_value":"ok"}']))
+    assert success.status == 200
+    assert not any(name.lower() == "set-cookie" for name in success.headers)
 
     async def protected(context: Context[None], text: str) -> Mapping[str, object]:
         require_session(context)
@@ -251,9 +258,36 @@ async def test_routes_cors_and_auth_before_handler() -> None:
     protected_app = Application(
         {"probe.echo": Operation(decode, protected, encode)}, probe.open
     )
-    assert (
-        await protected_app.fetch(BytesRequest([b'{"wire_value":"ok"}']))
-    ).status == 401
+    denied_session = await protected_app.fetch(BytesRequest([b'{"wire_value":"ok"}']))
+    assert denied_session.status == 401
+    assert not any(name.lower() == "set-cookie" for name in denied_session.headers)
+
+
+async def test_native_refresh_failure_never_sets_cookie(db: Harness) -> None:
+    """M08: detect cookie deletion on an actual native refresh failure response."""
+    core = Auth(db.port(), create_database, now=db.now)
+
+    async def scope(request: Request) -> RequestScope[Context[None]]:
+        async def close() -> None:
+            pass
+
+        return RequestScope(Context(), close)
+
+    async def refresh(context: Context[None], value: str) -> Mapping[str, object]:
+        return (await core.refresh(value)).to_wire()
+
+    app = Application(
+        {"auth.refresh": Operation(decode, refresh, lambda value: value)}, scope
+    )
+    response = await app.fetch(
+        BytesRequest(
+            [b'{"wire_value":"malformed"}'], url="https://example.test/auth.refresh"
+        )
+    )
+    assert response.status == 401 and json.loads(response.body) == {
+        "error": "invalid_token"
+    }
+    assert not any(name.lower() == "set-cookie" for name in response.headers)
 
 
 @pytest.mark.parametrize("mode", ["success", "handler_failure", "bad_output"])

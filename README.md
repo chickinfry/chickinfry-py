@@ -131,3 +131,39 @@ The pinned asyncpg driver does not provide SCRAM-SHA-256-PLUS.
 ordinary SCRAM when binding is unavailable, and `disable` does not use it.
 Omitting that option does not require binding. These options do not change the
 explicit TLS certificate and hostname checks selected by `sslmode`.
+
+## Native session lifetime
+
+Native bearer sessions use a 30-day idle timeout (2592000 seconds), with no
+absolute lifetime cap by default (0). A successful refresh rolls the idle
+expiry forward from its issue time; access tokens still expire after 900
+seconds. Access checks do not renew the family. Expired or revoked credentials
+are never revived, and refresh reuse revokes the entire family, including the
+most recently issued credentials. Native responses never set or delete cookies.
+
+The runtime accepts `idle_timeout_seconds` (3600–31536000 integer seconds) and
+`absolute_lifetime_seconds` (0, or 3600–31536000 integer seconds) as keyword
+arguments to `Auth`. The absolute cap may be shorter than idle and is measured
+from the first login, including on access checks. Invalid values are rejected
+before database use. Existing users may need to sign in again when a policy
+is shortened or an absolute cap is enabled.
+
+Existing sessions retain their stored refresh expiry until a successful
+renewal converts them in the same transaction. Conversion preserves the
+family's original creation time as first login and records the renewal time.
+Before conversion, the current idle timeout is measured from the newest
+successfully issued refresh credential's recorded creation time; rejected
+requests and reuse do not move that baseline. The stored credential expiry
+is checked separately, so a changed policy cannot revive an expired credential.
+
+Cleanup selects ended families and preserves consumed credentials of live
+families for reuse detection. For existing sessions without a recorded renewal
+time, candidate selection can lag idle expiry by the access lifetime (900
+seconds); families older than seven days are also selected. The final decision
+is checked again under the family lock. Long-lived active families therefore
+retain their credential history.
+
+Non-default policy in generated Python applications is not supported yet:
+the CLI's generator wiring and support gate remain separate work. Browser
+cookie sessions are also unsupported. Cookie-only requests are anonymous in
+this native-only runtime; the browser cookie/bearer mixing rule does not apply.
