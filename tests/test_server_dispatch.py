@@ -197,6 +197,24 @@ async def test_streamed_utf8_request_boundary(size: int, status: int) -> None:
         (ServerError("unsafe detail", 403), 500, "operation_failed"),
         (ServerError("too_long_" * 9, 403), 500, "operation_failed"),
         (ServerError("permission_denied", 418), 500, "operation_failed"),
+        pytest.param(
+            ServerError("not_implemented", 501),
+            501,
+            "not_implemented",
+            id="catches_explicit_501_downgrade_or_changed_body",
+        ),
+        pytest.param(
+            NotImplementedError("private detail"),
+            500,
+            "operation_failed",
+            id="catches_builtin_not_implemented_promoted_to_501",
+        ),
+        pytest.param(
+            ServerError("other_code", 501),
+            500,
+            "operation_failed",
+            id="catches_other_code_allowed_at_501",
+        ),
     ],
 )
 async def test_error_boundary(failure: Exception, status: int, code: str) -> None:
@@ -204,12 +222,15 @@ async def test_error_boundary(failure: Exception, status: int, code: str) -> Non
     probe.failure = failure
     response = await probe.app().fetch(BytesRequest([b'{"wire_value":"ok"}']))
     assert response.status == status and json.loads(response.body) == {"error": code}
+    if status == 501:
+        assert response.body == b'{"error":"not_implemented"}'
     assert probe.opened == probe.closed == 1
     assert response.headers["Cache-Control"] == "no-store"
     assert not any(name.lower() == "set-cookie" for name in response.headers)
 
 
 async def test_routes_cors_and_auth_before_handler() -> None:
+    """Catch a missing session check allowing a protected handler to return 501."""
     probe = Probe()
     app = probe.app()
     for method, path in (
@@ -251,15 +272,20 @@ async def test_routes_cors_and_auth_before_handler() -> None:
     assert success.status == 200
     assert not any(name.lower() == "set-cookie" for name in success.headers)
 
+    probe.failure = ServerError("not_implemented", 501)
+
     async def protected(context: Context[None], text: str) -> Mapping[str, object]:
         require_session(context)
-        return {"wire_value": text}
+        return await probe.invoke(context, text)
 
     protected_app = Application(
         {"probe.echo": Operation(decode, protected, encode)}, probe.open
     )
     denied_session = await protected_app.fetch(BytesRequest([b'{"wire_value":"ok"}']))
-    assert denied_session.status == 401
+    assert denied_session.status == 401 and json.loads(denied_session.body) == {
+        "error": "unauthenticated"
+    }
+    assert probe.calls == 1
     assert not any(name.lower() == "set-cookie" for name in denied_session.headers)
 
 

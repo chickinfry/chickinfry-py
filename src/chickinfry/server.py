@@ -209,11 +209,16 @@ class Application(Generic[C]):
                 isinstance(error.code, str)
                 and re.fullmatch(r"[a-z_]{1,64}", error.code)
                 and type(error.status) is int
-                and error.status in _STATUSES
+                and (
+                    error.status in _STATUSES
+                    or (error.status == 501 and error.code == "not_implemented")
+                )
             )
             code, status = (
                 (error.code, error.status) if safe else ("operation_failed", 500)
             )
+            if status == 501:
+                return Response(501, b'{"error":"not_implemented"}', headers)
             return Response(status, json.dumps({"error": code}).encode(), headers)
         except Exception:
             return Response(500, b'{"error":"operation_failed"}', headers)
