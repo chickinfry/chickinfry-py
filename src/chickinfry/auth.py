@@ -602,7 +602,11 @@ class Auth:
             or family <= instant
         ):
             raise ServerError("invalid_token", 401)
-        return Session(record.id, User(user.id, user.email))
+        return Session(
+            record.id,
+            User(user.id, user.email),
+            format_timestamp(min(parse_timestamp(record.expires_at), family)),
+        )
 
     async def session(self, access_token: str) -> Session:
         _validate_token(access_token)

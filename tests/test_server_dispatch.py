@@ -4,13 +4,15 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
+from datetime import timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from chickinfry._auth_database import create_database
+from chickinfry._auth_database import Database, create_database
 from chickinfry.auth import Auth
 from chickinfry.errors import OperationError
+from chickinfry.orm import format_timestamp, parse_timestamp
 from chickinfry.server import (
     Application,
     Context,
@@ -18,6 +20,7 @@ from chickinfry.server import (
     Request,
     RequestScope,
     ServerError,
+    Session,
     bearer,
     require_session,
 )
@@ -313,6 +316,83 @@ async def test_native_refresh_failure_never_sets_cookie(db: Harness) -> None:
     assert response.status == 401 and json.loads(response.body) == {
         "error": "invalid_token"
     }
+    assert not any(name.lower() == "set-cookie" for name in response.headers)
+
+
+@pytest.mark.parametrize(
+    "row_seconds,idle_seconds,absolute_seconds,expected_seconds",
+    [
+        pytest.param(900, 7200, 0, 900, id="row"),
+        pytest.param(7200, 3600, 0, 3600, id="idle"),
+        pytest.param(10800, 7200, 3600, 3600, id="absolute"),
+    ],
+)
+async def test_auth_session_effective_expiry(
+    db: Harness,
+    row_seconds: int,
+    idle_seconds: int,
+    absolute_seconds: int,
+    expected_seconds: int,
+) -> None:
+    db.instant += timedelta(microseconds=123456)
+    core = Auth(db.port(), create_database, now=db.now)
+    tokens = await core.signup("session@example.test", "a long test password")
+    await Database(db.port()).sessions.update(
+        {"id": tokens.session_id},
+        {"expires_at": format_timestamp(db.now() + timedelta(seconds=row_seconds))},
+    )
+    core = Auth(
+        db.port(),
+        create_database,
+        now=db.now,
+        idle_timeout_seconds=idle_seconds,
+        absolute_lifetime_seconds=absolute_seconds,
+    )
+
+    async def scope(request: Request) -> RequestScope[Context[None]]:
+        token = bearer(request.headers)
+        assert token is not None
+
+        async def close() -> None:
+            pass
+
+        return RequestScope(Context(session=await core.session(token)), close)
+
+    async def session(context: Context[None], value: Mapping[str, object]) -> Session:
+        return require_session(context)
+
+    def encode_session(value: Session) -> Mapping[str, object]:
+        return {
+            "id": value.user.id,
+            "email": value.user.email,
+            "session_id": value.id,
+            "expires_at": value.expires_at,
+        }
+
+    app = Application(
+        {"auth.session": Operation(lambda value: value, session, encode_session)}, scope
+    )
+    response = await app.fetch(
+        BytesRequest(
+            [b"{}"],
+            url="https://example.test/auth.session",
+            headers={
+                "content-type": "application/json",
+                "authorization": "Bearer " + tokens.access_token,
+            },
+        )
+    )
+    expected = format_timestamp(db.now() + timedelta(seconds=expected_seconds))
+    assert response.status == 200
+    assert json.loads(response.body) == {
+        "id": tokens.user_id,
+        "email": "session@example.test",
+        "session_id": tokens.session_id,
+        "expires_at": expected,
+    }
+    assert expected.endswith(".123456Z")
+    parsed = parse_timestamp(json.loads(response.body)["expires_at"])
+    assert parsed.microsecond == 123456 and parsed.tzinfo is timezone.utc
     assert not any(name.lower() == "set-cookie" for name in response.headers)
 
 

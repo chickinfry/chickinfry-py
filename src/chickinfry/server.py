@@ -40,6 +40,7 @@ class User:
 class Session:
     id: str
     user: User
+    expires_at: str
 
 
 @dataclass(frozen=True, slots=True)
