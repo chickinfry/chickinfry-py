@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from http.cookiejar import CookieJar
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
-from ._conformance import _observer
+from ._conformance import _HookError, _observer
 from ._http_common import (
     _HEADERS,
     _Body,
@@ -126,6 +126,9 @@ class AsyncHTTP:
         token: str | None,
         store: SessionStore | None,
     ) -> object:
+        observation = _observer.get()
+        if observation is not None:
+            await observation.aarrive("sdk-entered", {"entered": True})
         self._check_loop()
         deadline = asyncio.get_running_loop().time() + 3 * self._timeout
         _operation(operation)
@@ -158,6 +161,10 @@ class AsyncHTTP:
                             or not _refresh_candidate(operation, failure)
                         ):
                             raise
+                        if observation is not None:
+                            await observation.aarrive(
+                                "both-originals-rejected", {"httpStatus": 401}
+                            )
                         await self._refresh(store, snapshot, generation)
                         latest = store.credentials()
                         if latest is None:
@@ -187,6 +194,7 @@ class AsyncHTTP:
             if flight is None:
                 if not store._current(snapshot, generation):
                     return
+        elected = flight is None
         if flight is None:
             flight = asyncio.create_task(
                 self._rotate(
@@ -199,6 +207,13 @@ class AsyncHTTP:
             with store._locked():
                 store._flights[generation] = flight
             flight.add_done_callback(functools.partial(store._settled, generation))
+        observation = _observer.get()
+        if observation is not None:
+            observation.flight = flight
+            if not elected and observation.flight_ref is not None and not flight.done():
+                await observation.aarrive(
+                    "refresh-joined", {"refreshRef": observation.flight_ref(flight)}
+                )
         failure = await asyncio.shield(flight)
         if failure is not None:
             raise failure.error()
@@ -223,6 +238,8 @@ class AsyncHTTP:
             credentials = cast(SessionCredentials, value)
         except ClientError as error:
             failure = _Failure.from_error(error)
+        except _HookError:
+            failure = _Failure("network_error", retryable=True, hook_failed=True)
         with store._locked():
             if asyncio.get_running_loop().time() >= deadline:
                 failure = _Failure(
@@ -231,6 +248,7 @@ class AsyncHTTP:
                     outcome_unknown=failure.outcome_unknown
                     if failure is not None
                     else False,
+                    hook_failed=failure.hook_failed if failure is not None else False,
                 )
                 credentials = None
             store._apply_refresh(snapshot, generation, credentials, failure)
@@ -254,6 +272,7 @@ class AsyncHTTP:
         observation = _observer.get()
         if observation is not None:
             deadline = min(deadline, observation.deadline)
+        refresh = operation == "auth.refresh"
         state = _RequestState()
         with _request_logs():
             import httpx
@@ -274,7 +293,14 @@ class AsyncHTTP:
                         self._origin + "/" + operation,
                         content=body,
                         headers=headers,
-                        extensions={"trace": state.atrace},
+                        extensions={
+                            "trace": functools.partial(observation.atrace, state)
+                            if credentials
+                            and observation is not None
+                            and observation.flight is not None
+                            and observation.flight_ref is not None
+                            else state.atrace
+                        },
                     ) as response:
                         status = response.status_code
                         if observation is not None:
@@ -282,21 +308,28 @@ class AsyncHTTP:
                                 status, response.headers.values()
                             )
                         if 300 <= status < 400:
-                            state.finish()
+                            if not refresh:
+                                state.finish()
                             raise OperationError("redirect_not_allowed", status)
                         data = await _read_body(response)
                         if observation is not None:
                             observation.record_body(data)
-                        state.finish()
+                        if not refresh:
+                            state.finish()
                         _check_deadline(deadline)
                         value = _response(data, status)
-                        if credentials:
+                        if refresh:
                             try:
-                                value = _read_credentials(value)
+                                decoded = _read_credentials(value)
                             except ClientError:
                                 failure = ClientError("invalid_response", status)
+                            else:
+                                if credentials:
+                                    value = decoded
                         _check_deadline(deadline)
                     _check_deadline(deadline)
+                    if refresh and failure is None:
+                        state.finish()
             except (TimeoutError, httpx.TimeoutException) as error:
                 if observation is not None:
                     observation.details.extend((type(error).__name__, str(error)))
@@ -306,6 +339,13 @@ class AsyncHTTP:
                     observation.details.extend((type(error).__name__, str(error)))
                 failure = ClientError("network_error", status)
             except ClientError as error:
+                if (
+                    refresh
+                    and isinstance(error, OperationError)
+                    and error._valid_error_envelope
+                    and error.status == 401
+                ):
+                    state.finish()
                 failure = error
             if asyncio.get_running_loop().time() >= deadline:
                 failure = ClientError("timeout", status)

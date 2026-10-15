@@ -117,8 +117,10 @@ class Peer:
     async def __aexit__(self, *args: object) -> None:
         assert self._server is not None
         self._server.close()
-        await self._server.wait_closed()
-        for task in self._tasks:
+        tasks = tuple(self._tasks)
+        for task in tasks:
             task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        async with asyncio.timeout(5):
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self._server.wait_closed()
         assert not self.errors, "fixture handler failed"

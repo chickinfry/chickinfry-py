@@ -408,9 +408,7 @@ async def test_unknown_refresh_blocks_generation_until_replace(
             with pytest.raises(ClientError) as first:
                 await _call(owner, store=store)
             assert originals == 1 and refreshes == 1
-            assert first.value._outcome_unknown == (
-                outcome in {"timeout", "disconnect"}
-            )
+            assert first.value._outcome_unknown
             with pytest.raises(OperationError) as later:
                 await _call(owner, store=store)
             assert later.value.code == "invalid_token" and later.value.status == 401
@@ -562,10 +560,18 @@ def test_package_does_not_export_private_conformance_hooks() -> None:
         "SessionCredentials",
         "SessionStore",
     }
-    private = {"_observer", "_Observation", "_outcome_unknown"}
+    private = {
+        "_observer",
+        "_Observation",
+        "_outcome_unknown",
+        "_HookError",
+        "_ClearAttempt",
+        "_clear_attempts",
+    }
     assert private.isdisjoint(vars(chickinfry))
     assert private.isdisjoint(dir(chickinfry))
     assert not any(hasattr(chickinfry, name) for name in private)
+    assert all(name not in Path("README.md").read_text() for name in private)
     # Importing a submodule installs its own name on the parent package.
     assert {
         name for name, value in vars(chickinfry).items() if value is _conformance
@@ -658,3 +664,64 @@ async def test_well_formed_refresh_401_clears_only_expected_without_retry(
             assert not caught.value._outcome_unknown
             assert store.credentials() is None
             assert len(peer.received) == 2
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize("status", [200, 401])
+async def test_refresh_hooks_preserve_unregistered_session_behavior(
+    mode: str, status: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from chickinfry._conformance import _ClearAttempt, _Observation, _observer
+
+    rotated = credentials()
+    outcomes: list[tuple[object, bool, int, int]] = []
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("An unregistered session hook performed work.")
+
+    for registered in (False, True):
+
+        async def handler(request: Received, writer: asyncio.StreamWriter) -> None:
+            if request.path == "/auth.refresh":
+                await respond(
+                    writer,
+                    json_bytes(asdict(rotated))
+                    if status == 200
+                    else b'{"error":"invalid_token"}',
+                    status=status,
+                )
+            else:
+                signed = (
+                    request.headers.get("authorization")
+                    == "Bearer " + rotated.access_token
+                )
+                await respond(
+                    writer,
+                    b"{}" if signed else b'{"error":"invalid_token"}',
+                    status=200 if signed else 401,
+                )
+
+        async with Peer(handler) as peer, _owner(mode, peer.origin) as owner:
+            store = SessionStore(peer.origin, credentials())
+            observation = _Observation(float("inf")) if registered else None
+            token = _observer.set(observation) if observation is not None else None
+            try:
+                with monkeypatch.context() as guard:
+                    if not registered:
+                        guard.setattr(_ClearAttempt, "__init__", forbidden)
+                        for method in ("arrive", "aarrive", "trace", "atrace"):
+                            guard.setattr(_Observation, method, forbidden)
+                    try:
+                        value: object = await _call(owner, store=store)
+                    except OperationError as error:
+                        value = (error.code, error.status, error._outcome_unknown)
+                current = store.credentials()
+                outcomes.append(
+                    (value, current == rotated, store._generation, len(peer.received))
+                )
+                assert store._active == {} and store._clear_attempts is None
+                assert store._flights == {} and store._sync_flights == {}
+            finally:
+                if token is not None:
+                    _observer.reset(token)
+    assert outcomes[0] == outcomes[1]

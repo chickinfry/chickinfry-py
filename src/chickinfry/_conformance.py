@@ -1,10 +1,26 @@
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .errors import _MESSAGES, ClientError
+
+if TYPE_CHECKING:
+    from ._request_state import _RequestState
+    from .session import SessionCredentials
+
+
+class _HookError(Exception):
+    pass
+
+
+@dataclass(repr=False)
+class _ClearAttempt:
+    call_id: str
+    expected: "SessionCredentials"
+    removed: bool
 
 
 @dataclass(repr=False)
@@ -13,6 +29,46 @@ class _Observation:
     status: int | None = None
     details: list[str] = field(default_factory=list)
     body_checked: bool = False
+    call_id: str = ""
+    barrier: Callable[[str, dict[str, object]], None] | None = None
+    async_barrier: Callable[[str, dict[str, object]], Awaitable[None]] | None = None
+    flight: object | None = None
+    flight_ref: Callable[[object], str] | None = None
+    hook_failed: bool = False
+
+    def arrive(self, point: str, facts: dict[str, object]) -> None:
+        if self.barrier is not None:
+            try:
+                self.barrier(point, facts)
+            except Exception:
+                self.hook_failed = True
+                raise _HookError() from None
+
+    async def aarrive(self, point: str, facts: dict[str, object]) -> None:
+        if self.async_barrier is not None:
+            try:
+                await self.async_barrier(point, facts)
+            except Exception:
+                self.hook_failed = True
+                raise _HookError() from None
+
+    def trace(
+        self, state: "_RequestState", event: str, info: dict[str, object]
+    ) -> None:
+        state.trace(event, info)
+        if event.endswith(".receive_response_headers.started"):
+            assert self.flight is not None and self.flight_ref is not None
+            self.arrive("refresh-joined", {"refreshRef": self.flight_ref(self.flight)})
+
+    async def atrace(
+        self, state: "_RequestState", event: str, info: dict[str, object]
+    ) -> None:
+        state.trace(event, info)
+        if event.endswith(".receive_response_headers.started"):
+            assert self.flight is not None and self.flight_ref is not None
+            await self.aarrive(
+                "refresh-joined", {"refreshRef": self.flight_ref(self.flight)}
+            )
 
     def _detail(self, value: str) -> None:
         self.details.append(value)

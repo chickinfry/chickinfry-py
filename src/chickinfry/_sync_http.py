@@ -1,3 +1,4 @@
+import functools
 import threading
 import time
 from collections.abc import Iterator, Mapping
@@ -5,7 +6,7 @@ from contextlib import contextmanager
 from http.cookiejar import CookieJar
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
-from ._conformance import _observer
+from ._conformance import _HookError, _Observation, _observer
 from ._http_common import (
     _HEADERS,
     _Body,
@@ -133,6 +134,9 @@ class HTTP:
         token: str | None,
         store: SessionStore | None,
     ) -> object:
+        observation = _observer.get()
+        if observation is not None:
+            observation.arrive("sdk-entered", {"entered": True})
         deadline = time.monotonic() + 3 * self._timeout
         _check_environment()
         with self._locked(deadline):
@@ -164,6 +168,8 @@ class HTTP:
                     or not _refresh_candidate(operation, failure)
                 ):
                     raise
+                if observation is not None:
+                    observation.arrive("both-originals-rejected", {"httpStatus": 401})
                 self._refresh(store, snapshot, generation, deadline)
                 with store._locked(deadline):
                     latest = store._credentials
@@ -192,12 +198,17 @@ class HTTP:
                 flight = _SyncFlight(time.monotonic() + self._timeout)
                 store._sync_flights[generation] = flight
                 elected = True
+        observation = _observer.get()
+        if observation is not None:
+            observation.flight = flight
         if elected:
             thread: threading.Thread | None = None
             try:
                 thread = threading.Thread(
                     target=self._produce,
-                    args=(store, snapshot, generation, flight),
+                    args=(store, snapshot, generation, flight, observation)
+                    if observation is not None
+                    else (store, snapshot, generation, flight),
                     daemon=False,
                 )
                 with store._locked():
@@ -219,6 +230,14 @@ class HTTP:
                     self._watch_start(store, snapshot, generation, flight)
                     if not isinstance(error, Exception):
                         raise
+        elif (
+            observation is not None
+            and observation.flight_ref is not None
+            and not flight.settled
+        ):
+            observation.arrive(
+                "refresh-joined", {"refreshRef": observation.flight_ref(flight)}
+            )
         with store._locked(deadline):
             while not flight.settled:
                 now = time.monotonic()
@@ -286,10 +305,12 @@ class HTTP:
         snapshot: SessionCredentials,
         generation: int,
         flight: _SyncFlight,
+        hook: _Observation | None = None,
     ) -> None:
         credentials: SessionCredentials | None = None
         failure: _Failure | None = _Failure("network_error")
         observation = _state.set(flight.request_state)
+        registration = _observer.set(hook) if hook is not None else None
         try:
             credentials = cast(
                 SessionCredentials,
@@ -304,11 +325,15 @@ class HTTP:
             failure = None
         except ClientError as error:
             failure = _Failure.from_error(error)
+        except _HookError:
+            failure = _Failure("network_error", retryable=True, hook_failed=True)
         except BaseException:
             failure = _Failure("network_error")
         finally:
             _state.reset(observation)
             self._publish(store, snapshot, generation, flight, credentials, failure)
+            if registration is not None:
+                _observer.reset(registration)
 
     def _publish(
         self,
@@ -326,6 +351,9 @@ class HTTP:
                         "timeout",
                         failure.status if failure is not None else None,
                         outcome_unknown=flight.request_state.outcome_unknown,
+                        hook_failed=failure.hook_failed
+                        if failure is not None
+                        else False,
                     )
                     credentials = None
                 store._apply_refresh(snapshot, generation, credentials, failure)
@@ -346,6 +374,7 @@ class HTTP:
         *,
         credentials: bool = False,
     ) -> object:
+        refresh = operation == "auth.refresh"
         state = _state.get() or _RequestState()
         observation = _observer.get()
         if observation is not None:
@@ -373,7 +402,14 @@ class HTTP:
                         self._origin + "/" + operation,
                         content=body,
                         headers=headers,
-                        extensions={"trace": state.trace},
+                        extensions={
+                            "trace": functools.partial(observation.trace, state)
+                            if credentials
+                            and observation is not None
+                            and observation.flight is not None
+                            and observation.flight_ref is not None
+                            else state.trace
+                        },
                     ) as response:
                         status = response.status_code
                         if observation is not None:
@@ -381,7 +417,8 @@ class HTTP:
                                 status, response.headers.values()
                             )
                         if 300 <= status < 400:
-                            state.finish()
+                            if not refresh:
+                                state.finish()
                             raise OperationError("redirect_not_allowed", status)
                         decoder = _Body(
                             response.headers.get("content-encoding", "identity"), status
@@ -393,16 +430,18 @@ class HTTP:
                         data = decoder.finish()
                         if observation is not None:
                             observation.record_body(data)
-                        state.finish()
+                        if not refresh:
+                            state.finish()
                         value = _response(data, status)
-                        if credentials:
+                        if refresh:
                             try:
-                                value = _read_credentials(value)
+                                decoded = _read_credentials(value)
                             except ClientError:
                                 reason = "invalid_response"
                             else:
                                 _remaining()
-                                return value
+                                state.finish()
+                                return decoded if credentials else value
                         else:
                             _remaining()
                             return value
@@ -426,6 +465,13 @@ class HTTP:
                         observation.details.extend((type(error).__name__, str(error)))
                     reason = "network_error"
                 except ClientError as error:
+                    if (
+                        refresh
+                        and isinstance(error, OperationError)
+                        and error._valid_error_envelope
+                        and error.status == 401
+                    ):
+                        state.finish()
                     failure = error
             finally:
                 _deadline.reset(context)

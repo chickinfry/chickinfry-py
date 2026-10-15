@@ -1,0 +1,15 @@
+database:
+  profile: postgresql
+  tables:
+    records:
+      columns:
+        id: {type: id, primary_key: true, default: {kind: uuid}}
+        wire_value: {type: string, default: {kind: string, literal: initial}}
+        note: {type: string, nullable: true}
+        happened_on: {type: date}
+        observed_at: {type: timestamp}
+    memberships:
+      columns:
+        group_id: {type: id, primary_key: true}
+        member_id: {type: id, primary_key: true}
+        note: {type: string, nullable: true}

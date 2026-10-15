@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
+from ._conformance import _ClearAttempt, _HookError, _observer
 from ._origin import canonical_origin
 from ._request_state import _RequestState
 from .errors import ClientError, OperationError
@@ -75,6 +76,7 @@ class _Failure:
     valid_error_envelope: bool = False
     retryable: bool = False
     outcome_unknown: bool = False
+    hook_failed: bool = False
 
     @classmethod
     def from_error(cls, error: ClientError) -> "_Failure":
@@ -87,6 +89,8 @@ class _Failure:
         )
 
     def error(self) -> ClientError:
+        if self.hook_failed:
+            raise _HookError()
         error: ClientError
         if self.code is not None and self.status is not None:
             error = OperationError(self.code, self.status)
@@ -134,6 +138,7 @@ class SessionStore:
         self._active: dict[int, int] = {}
         self._flights: dict[int, asyncio.Task[_Failure | None]] = {}
         self._sync_flights: dict[int, _SyncFlight] = {}
+        self._clear_attempts: list[_ClearAttempt] | None = None
         if credentials is not None:
             self.replace(credentials)
 
@@ -196,10 +201,16 @@ class SessionStore:
     def clear(self, expected: SessionCredentials) -> None:
         with self._locked():
             self._check_loop()
-            if self._credentials is expected:
+            removed = self._credentials is expected
+            if removed:
                 self._credentials = None
                 self._generation += 1
                 self._condition.notify_all()
+            observation = _observer.get()
+            if observation is not None and self._clear_attempts is not None:
+                self._clear_attempts.append(
+                    _ClearAttempt(observation.call_id, expected, removed)
+                )
 
     def _register(
         self, deadline: float | None = None
@@ -227,7 +238,20 @@ class SessionStore:
         credentials: SessionCredentials | None,
         failure: _Failure | None,
     ) -> None:
+        if failure is not None and failure.hook_failed:
+            return
         if not self._current(snapshot, generation):
+            observation = _observer.get()
+            if (
+                observation is not None
+                and self._clear_attempts is not None
+                and failure is not None
+                and failure.valid_error_envelope
+                and failure.status == 401
+            ):
+                self._clear_attempts.append(
+                    _ClearAttempt(observation.call_id, snapshot, False)
+                )
             return
         if failure is None and credentials is not None:
             self.replace(credentials)
