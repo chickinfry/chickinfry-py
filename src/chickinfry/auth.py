@@ -18,6 +18,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Protocol, TypeVar
+from uuid import UUID
 
 from ._password import CPythonScrypt, PasswordKDF, hash_password, verify_password
 from .orm import (
@@ -1008,6 +1009,9 @@ class Auth:
             work.close()
             self._cleanup_failure("schedule")
 
+    def _cleanup_start(self) -> str:
+        return str(UUID(bytes=secrets.token_bytes(16), version=4))
+
     async def _cleanup(self, port: DatabasePort, invites_only: bool) -> None:
         db = self.create_database(port)
         cutoff = self._timestamp()
@@ -1054,17 +1058,29 @@ class Auth:
                             ),
                         )
                     )
-                sessions = await db.sessions.find_many(
-                    where=and_(
-                        _filter(db.sessions, "transport", "=", "native"),
-                        or_(*candidates),
-                    ),
-                    limit=32,
-                    order_by=(
-                        Order(db.sessions.table.columns["expires_at"], "asc"),
-                        Order(db.sessions.table.columns["id"], "asc"),
-                    ),
+                eligible = and_(
+                    _filter(db.sessions, "transport", "=", "native"),
+                    or_(*candidates),
                 )
+                start = self._cleanup_start()
+                order = (Order(db.sessions.table.columns["id"], "asc"),)
+                sessions = list(
+                    await db.sessions.find_many(
+                        where=and_(eligible, _filter(db.sessions, "id", ">=", start)),
+                        limit=32,
+                        order_by=order,
+                    )
+                )
+                if len(sessions) < 32:
+                    sessions.extend(
+                        await db.sessions.find_many(
+                            where=and_(
+                                eligible, _filter(db.sessions, "id", "<", start)
+                            ),
+                            limit=32 - len(sessions),
+                            order_by=order,
+                        )
+                    )
                 refresh_attempts = 0
                 for session in sessions:
 

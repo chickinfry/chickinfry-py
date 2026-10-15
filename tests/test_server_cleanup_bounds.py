@@ -1,5 +1,6 @@
 import asyncio
 import json
+import secrets
 import sys
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ import pytest
 from chickinfry._auth_database import Database as PrivateDatabase
 from chickinfry._auth_database import create_database
 from chickinfry.auth import Auth, CleanupContext, hash_token, random_token
-from chickinfry.orm import DatabasePort, format_timestamp, parse_timestamp
+from chickinfry.orm import DatabasePort, format_timestamp
 from chickinfry.postgres import PostgresPort
 from chickinfry.server import ServerError
 
@@ -34,6 +35,7 @@ class PassCounts:
     invite_zero_rows: int = 0
     closed: bool = False
     candidates: list[str] = field(default_factory=list)
+    session_queries: int = 0
 
 
 class CountingPort:
@@ -55,6 +57,7 @@ class CountingPort:
                 self.counts.auth_attempts += 1
         rows = await self.delegate.query(sql, parameters)
         if sql.startswith("select ") and 'from "public"."app_auth_sessions"' in sql:
+            self.counts.session_queries += 1
             self.counts.candidates.extend(str(row["id"]) for row in rows)
         if deleting:
             if invite:
@@ -316,14 +319,87 @@ async def test_cleanup_growth_rejects_expired_refresh_and_eventually_selects_fam
     assert not await private.refresh_tokens.find_many()
 
 
+async def test_cleanup_start_is_generated_once_per_pass(
+    db: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    core = Auth(db.port(), create_database, now=db.now)
+    generate = core._cleanup_start
+    starts: list[str] = []
+
+    def record_start() -> str:
+        value = generate()
+        starts.append(value)
+        return value
+
+    monkeypatch.setattr(core, "_cleanup_start", record_start)
+    root = db.port()
+    for count in (1, 2):
+        tally = PassCounts()
+        await core._cleanup(CountingPort(root, root, tally), False)
+        assert len(starts) == count
+        assert tally.session_queries == 2
+        assert UUID(starts[-1]).version == 4
+        assert str(UUID(starts[-1])) == starts[-1]
+    assert starts[0] != starts[1]
+
+
+async def test_cleanup_start_boundary_selects_each_candidate_once(
+    db: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K3: the wrap-around segment must not reselect the start row."""
+    core = Auth(db.port(), create_database, now=db.now)
+    private = PrivateDatabase(db.port())
+    owner = await private.users.insert({"email": "start-boundary@example.test"})
+    expected: list[str] = []
+    for i in range(5):
+        row = await private.sessions.insert(
+            {
+                "id": str(UUID(int=i + 1)),
+                "user_id": owner.id,
+                "token_hash": hash_token(random_token()),
+                "user_session_version": 1,
+                "created_at": format_timestamp(db.now() - timedelta(days=8)),
+                "expires_at": format_timestamp(db.now() - timedelta(days=8)),
+            }
+        )
+        expected.append(row.id)
+    monkeypatch.setattr(core, "_cleanup_start", lambda: expected[2])
+    tally = PassCounts()
+    root = db.port()
+    await core._cleanup(CountingPort(root, root, tally), False)
+    assert len(tally.candidates) == len(set(tally.candidates)) == len(expected)
+    assert sorted(tally.candidates) == sorted(expected)
+
+
+async def test_cleanup_start_draws_entropy_from_secrets(
+    db: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K5b: the cleanup start must come from the OS CSPRNG, not a seeded PRNG."""
+    calls: list[int] = []
+
+    def fake_token_bytes(count: int) -> bytes:
+        calls.append(count)
+        return bytes(range(count))
+
+    monkeypatch.setattr(secrets, "token_bytes", fake_token_bytes)
+    core = Auth(db.port(), create_database, now=db.now)
+    assert core._cleanup_start() == str(UUID(bytes=bytes(range(16)), version=4))
+    calls.clear()
+    root = db.port()
+    for passes in (1, 2):
+        tally = PassCounts()
+        await core._cleanup(CountingPort(root, root, tally), False)
+        # asyncpg's SCRAM handshake also draws from secrets on new connections.
+        assert [size for size in calls if size == 16] == [16] * passes
+
+
 @pytest.mark.parametrize("legacy", [False, True], ids=["modern", "legacy"])
 async def test_cleanup_shrink_progress_past_full_candidate_batch(
-    db: Harness, legacy: bool
+    db: Harness, legacy: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CLEANUP-GROW (b): catch policy bypass or starvation beyond the current idle."""
-    core = Auth(db.port(), create_database, now=db.now)
-    owner = await core.signup("shrink@example.test", "a long cleanup test password")
+    """F-05 shrink: reach dead families past a full live batch, including wrap-around."""
     private = PrivateDatabase(db.port())
+    owner = await private.users.insert({"email": "shrink@example.test"})
     started = db.now()
     issued = started - timedelta(minutes=30) if legacy else started
     access_expiry = (
@@ -331,49 +407,42 @@ async def test_cleanup_shrink_progress_past_full_candidate_batch(
     )
     stored_expiry = format_timestamp(started + timedelta(days=6))
     blockers: list[str] = []
+    credentials: list[tuple[str, str]] = []
     for i in range(32):
-        values = {
-            "created_at": format_timestamp(
-                started - timedelta(days=1) if legacy else started
-            ),
-            "expires_at": format_timestamp(access_expiry),
-            "first_login_at": None if legacy else format_timestamp(started),
-            "last_renewed_at": None if legacy else format_timestamp(issued),
-        }
-        if i == 0:
-            row = await private.sessions.update({"id": owner.session_id}, values)
-            assert row is not None
-            refresh = (await private.refresh_tokens.find_many())[0]
-            await private.refresh_tokens.update(
-                {"id": refresh.id},
-                {"created_at": format_timestamp(issued), "expires_at": stored_expiry},
-            )
-        else:
-            row = await private.sessions.insert(
-                {
-                    **values,
-                    "user_id": owner.user_id,
-                    "token_hash": hash_token(random_token()),
-                    "user_session_version": 1,
-                }
-            )
-            await private.refresh_tokens.insert(
-                {
-                    "session_id": row.id,
-                    "token_hash": hash_token(random_token()),
-                    "created_at": format_timestamp(issued),
-                    "expires_at": stored_expiry,
-                }
-            )
+        access, refresh = random_token(), random_token()
+        credentials.append((access, refresh))
+        row = await private.sessions.insert(
+            {
+                "id": f"00000000-0000-4000-8000-{i:012x}",
+                "user_id": owner.id,
+                "token_hash": hash_token(access),
+                "user_session_version": 1,
+                "created_at": format_timestamp(
+                    started - timedelta(days=1) if legacy else started
+                ),
+                "expires_at": format_timestamp(access_expiry),
+                "first_login_at": None if legacy else format_timestamp(started),
+                "last_renewed_at": None if legacy else format_timestamp(issued),
+            }
+        )
+        await private.refresh_tokens.insert(
+            {
+                "session_id": row.id,
+                "token_hash": hash_token(refresh),
+                "created_at": format_timestamp(issued),
+                "expires_at": stored_expiry,
+            }
+        )
         blockers.append(row.id)
     dead: list[str] = []
     dead_issued = (
         started - timedelta(minutes=90) if legacy else started + timedelta(seconds=1)
     )
-    for _ in range(2):
+    for i in range(2):
         row = await private.sessions.insert(
             {
-                "user_id": owner.user_id,
+                "id": f"ffffffff-ffff-4fff-bfff-{i:012x}",
+                "user_id": owner.id,
                 "token_hash": hash_token(random_token()),
                 "user_session_version": 1,
                 "created_at": format_timestamp(dead_issued),
@@ -394,51 +463,73 @@ async def test_cleanup_shrink_progress_past_full_candidate_batch(
     if not legacy:
         db.instant = started + timedelta(seconds=7200)
     shrunk = Auth(db.port(), create_database, now=db.now, idle_timeout_seconds=3600)
-    assert parse_timestamp(stored_expiry) > db.now()
-    if not legacy:
-        with pytest.raises(ServerError) as expired:
-            await shrunk.refresh(owner.refresh_token)
-        assert expired.value.status == 401 and expired.value.code == "session_revoked"
+    monkeypatch.setattr(shrunk, "_cleanup_start", lambda: blockers[0])
     root = db.port()
     if legacy:
-        live = await private.sessions.find_by_id({"id": owner.session_id})
-        assert live is not None
-        expiry = await shrunk._family_expiry(create_database(root), live)
-        assert expiry is not None and expiry > db.now()
-    for attempt in range(4 if legacy else 2):
-        tally = PassCounts()
-        await shrunk._cleanup(CountingPort(root, root, tally), False)
-        assert tally.auth_attempts <= 96
-        if legacy or attempt == 0:
-            assert set(tally.candidates) == set(blockers)
-        if legacy:
-            assert tally.auth_deleted == 0
-            surviving = await private.sessions.find_many()
-            assert all(row.revoked_at is None for row in surviving)
-            assert len(surviving) == 34
-    if legacy:
-        db.instant = issued + timedelta(seconds=3600, microseconds=-1)
-        tally = PassCounts()
-        await shrunk._cleanup(CountingPort(root, root, tally), False)
-        assert set(tally.candidates) == set(blockers)
-        preserved = await private.sessions.find_many()
-        assert len(preserved) == 34 and all(row.revoked_at is None for row in preserved)
-        assert len(await private.refresh_tokens.find_many()) == 34
-        db.instant = issued + timedelta(seconds=3600)
-        with pytest.raises(ServerError) as expired:
-            await shrunk.refresh(owner.refresh_token)
-        assert expired.value.status == 401 and expired.value.code == "session_revoked"
+        before_sessions = sorted(
+            await private.sessions.find_many(), key=lambda row: row.id
+        )
+        before_refresh = sorted(
+            await private.refresh_tokens.find_many(), key=lambda row: row.id
+        )
         for _ in range(2):
             tally = PassCounts()
             await shrunk._cleanup(CountingPort(root, root, tally), False)
-            assert tally.auth_attempts <= 96
-    surviving = await private.sessions.find_many()
-    remaining_dead = sum(row.id in dead for row in surviving)
-    assert remaining_dead == 0, (
-        f"Cleanup stalled behind {len(blockers)} candidates: "
-        f"{remaining_dead} dead families remain after the current idle elapsed."
-    )
-    assert not surviving
+            assert tally.candidates == blockers
+            assert tally.session_queries == 1 and tally.auth_deleted == 0
+            assert (
+                sorted(await private.sessions.find_many(), key=lambda row: row.id)
+                == before_sessions
+            )
+            assert (
+                sorted(await private.refresh_tokens.find_many(), key=lambda row: row.id)
+                == before_refresh
+            )
+
+        monkeypatch.setattr(shrunk, "_cleanup_start", lambda: dead[1])
+        tally = PassCounts()
+        await shrunk._cleanup(CountingPort(root, root, tally), False)
+        assert tally.candidates == [dead[1], *blockers[:31]]
+        assert tally.session_queries == 2 and tally.auth_deleted == 2
+        assert await private.sessions.find_by_id({"id": dead[1]}) is None
+        assert await private.sessions.find_by_id({"id": dead[0]}) is not None
+
+        random_core = Auth(
+            db.port(), create_database, now=db.now, idle_timeout_seconds=3600
+        )
+        for _ in range(8):
+            tally = PassCounts()
+            await random_core._cleanup(CountingPort(root, root, tally), False)
+            assert tally.session_queries <= 2 and len(tally.candidates) <= 32
+            assert len(set(tally.candidates)) == len(tally.candidates)
+            if await private.sessions.find_by_id({"id": dead[0]}) is None:
+                break
+        assert await private.sessions.find_by_id({"id": dead[0]}) is None
+        assert sorted(await private.sessions.find_many(), key=lambda row: row.id) == [
+            row for row in before_sessions if row.id in blockers
+        ]
+        assert sorted(
+            await private.refresh_tokens.find_many(), key=lambda row: row.id
+        ) == sorted(
+            [row for row in before_refresh if row.session_id in blockers],
+            key=lambda row: row.id,
+        )
+        db.instant = issued + timedelta(seconds=3600, microseconds=-1)
+        tally = PassCounts()
+        await shrunk._cleanup(CountingPort(root, root, tally), False)
+        assert tally.auth_deleted == 0 and tally.candidates == blockers
+        db.instant = issued + timedelta(seconds=3600)
+
+    for access, refresh in credentials:
+        for reject in (shrunk.session(access), shrunk.refresh(refresh)):
+            with pytest.raises(ServerError) as expired:
+                await reject
+            assert expired.value.status == 401
+    for _ in range(2):
+        tally = PassCounts()
+        await shrunk._cleanup(CountingPort(root, root, tally), False)
+        assert tally.auth_attempts <= 96
+    assert not await private.sessions.find_many()
     assert not await private.refresh_tokens.find_many()
 
 
