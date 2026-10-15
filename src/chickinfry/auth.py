@@ -35,6 +35,13 @@ from .server import ServerError, Session, User
 R_co = TypeVar("R_co", covariant=True)
 T = TypeVar("T")
 
+# ECMAScript trim and \s share this set; Python differs for U+0085 and U+FEFF.
+_EMAIL_WHITESPACE = (
+    "\t\n\v\f\r \u00a0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
+
 
 class AuthRepository(Protocol[R_co]):
     @property
@@ -233,14 +240,24 @@ def _validate_token(value: str) -> None:
         raise ServerError("invalid_token", 401)
 
 
+def _valid_email_format(email: str) -> bool:
+    local, separator, domain = email.partition("@")
+    return (
+        bool(local and separator)
+        and "@" not in domain
+        and "." in domain[1:-1]
+        and not any(character in _EMAIL_WHITESPACE for character in email)
+    )
+
+
 def normalize_email(value: str) -> str:
     if not isinstance(value, str):
         raise ServerError("invalid_input", 400)
-    email = value.strip().lower()
+    email = value.strip(_EMAIL_WHITESPACE).lower()
     if (
         "\0" in email
-        or len(email) > 320
-        or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email)
+        or len(email.encode("utf-16-le", "surrogatepass")) // 2 > 320
+        or not _valid_email_format(email)
     ):
         raise ServerError("invalid_input", 400)
     return email
