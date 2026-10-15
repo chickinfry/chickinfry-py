@@ -2,10 +2,12 @@ import asyncio
 import json
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta, timezone
 from pathlib import Path
+from types import ModuleType
+from typing import Protocol, cast
 
 import pytest
 
@@ -21,7 +23,12 @@ from chickinfry.server import (
     RequestScope,
     ServerError,
     Session,
+    _Body,
+    _Bytes,
+    _HostRequest,
+    _JSHeaders,
     bearer,
+    create_worker_entrypoint,
     require_session,
 )
 
@@ -474,3 +481,140 @@ assert "asyncpg" not in sys.modules
         timeout=10,
     )
     assert result.returncode == 0, result.stderr
+
+
+@dataclass
+class WorkersHeaders:
+    values: Mapping[str, str]
+
+    def get(self, key: str) -> str | None:
+        lowered = key.lower()
+        return next(
+            (value for key, value in self.values.items() if key.lower() == lowered),
+            None,
+        )
+
+
+@dataclass
+class WorkersBytes:
+    data: bytes
+
+    def to_py(self) -> bytes:
+        return self.data
+
+
+@dataclass
+class WorkersReadResult:
+    done: bool
+    value: _Bytes
+
+
+@dataclass
+class WorkersReader:
+    payload: bytes
+    drained: bool = False
+
+    async def read(self) -> WorkersReadResult:
+        if self.drained:
+            return WorkersReadResult(True, WorkersBytes(b""))
+        self.drained = True
+        return WorkersReadResult(False, WorkersBytes(self.payload))
+
+    async def cancel(self) -> None:
+        return None
+
+    def releaseLock(self) -> None:
+        return None
+
+
+@dataclass
+class WorkersBody:
+    payload: bytes
+
+    def getReader(self) -> WorkersReader:
+        return WorkersReader(self.payload)
+
+
+@dataclass
+class WorkersRequest:
+    method: str
+    url: str
+    headers: _JSHeaders
+    body: _Body | None
+
+
+def workers_response(
+    body: str | None, *, status: int, headers: Mapping[str, str]
+) -> object:
+    return (body, status, headers)
+
+
+class WorkersHost(ModuleType):
+    WorkerEntrypoint: type[object]
+    Response: Callable[..., object]
+
+
+class WorkersEntry(Protocol):
+    env: object
+    ctx: object
+
+    def fetch(self, request: WorkersRequest) -> Awaitable[object]: ...
+
+
+async def test_workers_entry_admits_only_allowlisted_request_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Proxy-Authorization is hop-by-hop (RFC 9110 11.7.2), and platform auth
+    # credentials must never reach generated handlers.
+    source = WorkersRequest(
+        method="POST",
+        url="https://example.test/probe.echo",
+        headers=WorkersHeaders(
+            {
+                "Proxy-Authorization": "dummy",
+                "Cookie": "dummy",
+                "Authorization": "dummy",
+                "Origin": "https://allowed.test",
+                "Content-Type": "application/json",
+                "X-Custom": "dummy",
+            }
+        ),
+        body=WorkersBody(b'{"wire_value":"ok"}'),
+    )
+    assert set(_HostRequest(source).headers) == {
+        "origin",
+        "content-type",
+        "authorization",
+    }
+
+    received: list[Mapping[str, str]] = []
+
+    async def scope(request: Request) -> RequestScope[Context[None]]:
+        received.append(request.headers)
+
+        async def close() -> None:
+            return None
+
+        return RequestScope(Context(), close)
+
+    async def invoke(context: Context[None], value: str) -> Mapping[str, object]:
+        return {"wire_value": value}
+
+    def factory(env: object, ctx: object) -> Application[Context[None]]:
+        return Application(
+            {"probe.echo": Operation(decode, invoke, encode)},
+            scope,
+            origins=frozenset({"https://allowed.test"}),
+        )
+
+    host = WorkersHost("workers")
+    host.WorkerEntrypoint = type("WorkerEntrypoint", (), {})
+    host.Response = workers_response
+    monkeypatch.setitem(sys.modules, "workers", host)
+    entry = cast(WorkersEntry, create_worker_entrypoint(factory)())
+    entry.env = object()
+    entry.ctx = object()
+    await entry.fetch(source)
+    assert len(received) == 1
+    assert "proxy-authorization" not in received[0]
+    assert "cookie" not in received[0]
