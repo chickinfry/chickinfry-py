@@ -104,9 +104,9 @@ class Response:
 
 
 class DispatchOperation(Protocol[_C]):
-    def prepare(
-        self, value: Mapping[str, object]
-    ) -> Callable[[_C], Awaitable[object]]: ...
+    """Receives raw JSON so authorization wrappers can defer input decoding."""
+
+    def prepare(self, value: object) -> Callable[[_C], Awaitable[object]]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,9 +117,9 @@ class Operation(Generic[Input, Output, C]):
     invoke: Callable[[C, Input], Awaitable[Output]]
     encode: Callable[[Output], object]
 
-    def prepare(self, value: Mapping[str, object]) -> Callable[[C], Awaitable[object]]:
+    def prepare(self, value: object) -> Callable[[C], Awaitable[object]]:
         try:
-            decoded = self.decode(value)
+            decoded = self.decode(_input_record(value))
         except Exception:
             raise ServerError("invalid_input", 400) from None
 
@@ -152,7 +152,7 @@ def _input_record(value: object) -> Mapping[str, object]:
 
 
 class Application(Generic[C]):
-    """The scope factory authenticates after input validation and cleans up failures itself."""
+    """Operation preparation controls validation before the request scope opens."""
 
     def __init__(
         self,
@@ -228,7 +228,7 @@ class Application(Generic[C]):
                 )
             except (ValueError, UnicodeError, RecursionError):
                 raise ServerError("invalid_json", 400) from None
-            prepared = operation.prepare(_input_record(value))
+            prepared = operation.prepare(value)
             scope = await self.open_scope(request)
             output = await prepared(scope.context)
             encoded = json.dumps(

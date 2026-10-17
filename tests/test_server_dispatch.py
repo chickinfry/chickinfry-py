@@ -163,6 +163,7 @@ async def test_api_id_missing_null_number_rejected(value: Mapping[str, object]) 
     [
         (b"null", "invalid_input"),
         (b"[]", "invalid_input"),
+        (b"1", "invalid_input"),
         (b"{}", "invalid_input"),
         (b'{"wire_value":null}', "invalid_input"),
         (b'{"wire_value":12}', "invalid_input"),
@@ -176,6 +177,33 @@ async def test_input_rejected_without_effects(body: bytes, code: str) -> None:
     response = await probe.app().fetch(BytesRequest([body]))
     assert response.status == 400 and json.loads(response.body) == {"error": code}
     assert probe.calls == probe.opened == 0
+
+
+@pytest.mark.parametrize("body", [b"null", b"[]", b"1"])
+async def test_deferred_decode_receives_raw_input_before_session_guard(
+    body: bytes,
+) -> None:
+    probe = Probe()
+    operation = Operation(decode, probe.invoke, encode)
+    received: list[object] = []
+
+    class ProtectedOperation:
+        def prepare(self, value: object) -> Callable[[_Scope], Awaitable[object]]:
+            received.append(value)
+
+            async def run(context: _Scope) -> object:
+                if context.session is None:
+                    raise ServerError("unauthenticated", 401)
+                return await operation.prepare(value)(context)
+
+            return run
+
+    app = Application({"probe.echo": ProtectedOperation()}, probe.open)
+    response = await app.fetch(BytesRequest([body]))
+    assert response.status == 401
+    assert json.loads(response.body) == {"error": "unauthenticated"}
+    assert received == [json.loads(body)]
+    assert probe.opened == probe.closed == 1 and probe.calls == 0
 
 
 @pytest.mark.parametrize(
