@@ -8,6 +8,7 @@ to the CPython installation.
 import asyncio
 import json
 import re
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from importlib import import_module
@@ -398,9 +399,12 @@ def create_worker_entrypoint(
     response_factory = cast(_HostResponse, host.Response)
 
     async def fetch(self: _Worker, request: _JSRequest) -> object:
+        environment = self.env
+        if sys.platform == "emscripten":
+            environment = getattr(self.env, "CHIK_LOCAL_BINDINGS", self.env)
         if setup is None:
             application = cast(Callable[[object, object], Application[C]], factory)(
-                self.env, self.ctx
+                environment, self.ctx
             )
         else:
             task = cast(
@@ -425,12 +429,22 @@ def create_worker_entrypoint(
                 raise RuntimeError("Application setup failed.") from None
             application = cast(
                 Callable[[object, object, Options], Application[C]], factory
-            )(self.env, self.ctx, options)
+            )(environment, self.ctx, options)
         response = await application.fetch(_HostRequest(request))
         return response_factory(
             response.body.decode() if response.body else None,
             status=response.status,
             headers=response.headers,
         )
+
+    if sys.platform == "emscripten":
+        from ._workerd import _fetch
+
+        original = fetch
+
+        async def workerd_fetch(self: _Worker, request: _JSRequest) -> object:
+            return await _fetch(original, self, request)
+
+        return type("Default", (base,), {"fetch": workerd_fetch})
 
     return type("Default", (base,), {"fetch": fetch})
