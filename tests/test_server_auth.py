@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from datetime import datetime, timedelta
 from typing import TypeVar, cast
@@ -60,6 +61,29 @@ def auth(
     )
 
 
+@pytest.mark.parametrize("operation", ["signin", "refresh"])
+async def test_email_verified_wire_output(db: Harness, operation: str) -> None:
+    core = auth(db)
+    initial = await core.signup("verification@example.test", PASSWORD)
+    tokens = (
+        await core.signin("verification@example.test", PASSWORD)
+        if operation == "signin"
+        else await core.refresh(initial.refresh_token)
+    )
+    wire = json.loads(json.dumps(tokens.to_wire()))
+    assert type(wire.get("email_verified")) is bool
+    assert wire.pop("email_verified") is False
+    unchanged = wire == {
+        "access_token": tokens.access_token,
+        "refresh_token": tokens.refresh_token,
+        "expires_at": tokens.expires_at,
+        "refresh_expires_at": tokens.refresh_expires_at,
+        "user_id": tokens.user_id,
+        "session_id": tokens.session_id,
+    }
+    assert unchanged
+
+
 async def test_tokens_expiry_and_logout(db: Harness) -> None:
     """M01/S-M3, M06/M07: reject fixed family expiry and access-driven renewal."""
     db.instant += timedelta(microseconds=123456)
@@ -92,6 +116,8 @@ async def test_tokens_expiry_and_logout(db: Harness) -> None:
     assert refresh.created_at == format_timestamp(started)
     assert parse_timestamp(initial.refresh_expires_at) == started + timedelta(days=30)
     actor = await core.session(initial.access_token)
+    assert type(actor.user.email_verified) is bool
+    assert actor.user.email_verified is False
     assert (
         actor.id == initial.session_id
         and actor.user.id == initial.user_id

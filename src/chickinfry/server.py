@@ -37,6 +37,8 @@ class ServerError(Exception):
 class User:
     id: str
     email: str
+    # No email_verified_at column; switch to the column's value when it is introduced.
+    email_verified: bool = False
 
 
 @dataclass(frozen=True, slots=True)

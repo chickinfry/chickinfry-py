@@ -17,7 +17,7 @@ import secrets
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Protocol, TypeVar
+from typing import Protocol, TypedDict, TypeVar
 from uuid import UUID
 
 from ._password import CPythonScrypt, PasswordKDF, hash_password, verify_password
@@ -177,6 +177,16 @@ class AuthUser:
     created_at: str
 
 
+class TokensWire(TypedDict):
+    access_token: str
+    refresh_token: str
+    expires_at: str
+    refresh_expires_at: str
+    user_id: str
+    session_id: str
+    email_verified: bool
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class Tokens:
     access_token: str
@@ -186,7 +196,7 @@ class Tokens:
     user_id: str
     session_id: str
 
-    def to_wire(self) -> Mapping[str, str]:
+    def to_wire(self) -> TokensWire:
         return {
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
@@ -194,6 +204,8 @@ class Tokens:
             "refresh_expires_at": self.refresh_expires_at,
             "user_id": self.user_id,
             "session_id": self.session_id,
+            # No email_verified_at column; switch to the column's value when it is introduced.
+            "email_verified": False,
         }
 
 
