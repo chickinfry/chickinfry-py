@@ -32,7 +32,7 @@ from .server_fixture import (
 
 async def test_defaults_keys_conditions_and_parameters(db: Harness) -> None:
     repo = records(db.port())
-    row = await repo.insert({"label": "quote' ; \ud55c\U0001f389"})
+    row = await repo.insert({"label": "quote' ; \ud55c\u1f389"})
     assert row.note == "default" and row.rank == 0
     with pytest.raises(FrozenInstanceError):
         setattr(row, "label", "changed")
