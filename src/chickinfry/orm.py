@@ -6,6 +6,7 @@ and execution.
 """
 
 import re
+import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -83,6 +84,12 @@ def encode_value(kind: ScalarKind, nullable: bool, value: object) -> object:
 
 
 def decode_value(kind: ScalarKind, nullable: bool, value: object) -> object:
+    if (
+        sys.platform == "emscripten"
+        and isinstance(value, str)
+        and kind in ("id", "date", "timestamp")
+    ):
+        value = encode_value(kind, nullable, value)
     if value is None:
         return encode_value(kind, nullable, value)
     if kind == "date":
