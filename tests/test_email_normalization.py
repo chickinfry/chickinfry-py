@@ -11,8 +11,8 @@ from chickinfry import auth
 from chickinfry.auth import normalize_email
 from chickinfry.server import ServerError
 
-# Source: chickinfry/chickinfry auth/testdata/emails.json at
-# 1365d4ca9e962b87374741417fefb50ae665b915.
+# Email normalization corpus pinned by the checksum below; every entry
+# must normalize exactly as the shared cross-runtime contract expects.
 _CORPUS_BYTES = (Path(__file__).parent / "testdata" / "emails.json").read_bytes()
 assert hashlib.sha256(_CORPUS_BYTES).hexdigest() == (
     "26e5f184b31eca32b1cbac279fb59d9042610ec15ef92f13bbf5f595ff809595"
