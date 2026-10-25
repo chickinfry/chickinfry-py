@@ -23,6 +23,11 @@ ROOT = Path(__file__).resolve().parents[1]
         ("_input.py", "if self.size > MAX_REQUEST_BYTES:", "if False:"),
         (
             "_input.py",
+            "size += _number_size(current)",
+            "size += len(json.dumps(current))",
+        ),
+        (
+            "_input.py",
             "        self._check()\n        self._counts[id(record)] = (record, count + 1)\n        return cast(object, json.loads(literal))",
             "        decoded = json.loads(literal)\n        self._check()\n        self._counts[id(record)] = (record, count + 1)\n        return cast(object, decoded)",
         ),
@@ -46,6 +51,7 @@ ROOT = Path(__file__).resolve().parents[1]
         "presence",
         "fresh-default",
         "budget",
+        "numeric-serialization",
         "clone-before-budget",
         "ignored-surrogates",
         "413-envelope",
@@ -63,7 +69,7 @@ def test_server_input_mutation_is_detected(
     shutil.copyfile(ROOT / "pyproject.toml", source / "pyproject.toml")
     path = source / "src/chickinfry" / module
     text = path.read_text()
-    expected_count = 3 if 'errors="strict"' in mutation else 1
+    expected_count = 2 if 'errors="strict"' in mutation else 1
     assert text.count(original) == expected_count, "The input mutation point changed"
     if "_defaults" in mutation:
         text = text.replace(
@@ -82,6 +88,7 @@ def test_server_input_mutation_is_detected(
             "-m",
             "pytest",
             "tests/test_server_input.py",
+            "tests/test_input_budget_numbers.py",
             "-q",
             "--tb=short",
         ],
