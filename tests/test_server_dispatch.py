@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import json
+import re
 import subprocess
 import sys
 import weakref
@@ -103,13 +104,17 @@ class Probe:
 
 def decode_id(value: Mapping[str, object]) -> str:
     id = value.get("id")
-    if not isinstance(id, str):
-        raise ValueError("An API ID requires a string.")
+    if not isinstance(id, str) or not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        id,
+        re.IGNORECASE,
+    ):
+        raise ValueError("An API ID requires a UUID string.")
     return id
 
 
 @pytest.mark.parametrize("failed", [False, True])
-async def test_api_id_preserves_non_uuid_string_before_handler(failed: bool) -> None:
+async def test_api_id_preserves_uuid_before_handler(failed: bool) -> None:
     probe = Probe()
     received: list[str] = []
 
@@ -128,17 +133,22 @@ async def test_api_id_preserves_non_uuid_string_before_handler(failed: bool) -> 
         probe.open,
     )
     response = await app.fetch(
-        BytesRequest([b'{"id":"not-a-uuid"}'], url="https://example.test/probe.id")
+        BytesRequest(
+            [b'{"id":"ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB"}'],
+            url="https://example.test/probe.id",
+        )
     )
-    assert received == ["not-a-uuid"]
+    assert received == ["ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB"]
     assert response.status == (500 if failed else 200)
     assert json.loads(response.body) == (
-        {"error": "operation_failed"} if failed else {"id": "not-a-uuid"}
+        {"error": "operation_failed"}
+        if failed
+        else {"id": "ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB"}
     )
 
 
-@pytest.mark.parametrize("value", [{}, {"id": None}, {"id": 12}])
-async def test_api_id_missing_null_number_rejected(value: Mapping[str, object]) -> None:
+@pytest.mark.parametrize("value", [{}, {"id": None}, {"id": 12}, {"id": "not-a-uuid"}])
+async def test_api_id_invalid_input_rejected(value: Mapping[str, object]) -> None:
     probe = Probe()
     received: list[str] = []
 
