@@ -5,6 +5,7 @@ from http.cookiejar import CookieJar
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
 from ._conformance import _HookError, _observer
+from ._device import _device_store, _DeviceStore, _persist_settings
 from ._http_common import (
     _HEADERS,
     _Body,
@@ -21,10 +22,10 @@ from ._request_state import _RequestState
 from .errors import ClientError, OperationError
 from .session import (
     SessionCredentials,
-    SessionStore,
     _Failure,
     _read_credentials,
     _refresh_candidate,
+    _SessionStore,
     _valid_token,
 )
 
@@ -50,10 +51,17 @@ class ClientTransport(Protocol):
 class AsyncHTTP:
     """An anonymous origin-bound transport owning the lifetime of its HTTP pool."""
 
-    def __init__(self, origin: str, *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        origin: str,
+        *,
+        timeout: float = 30.0,
+        persist: bool | Mapping[str, object] = True,
+    ) -> None:
         _check_environment()
         self._origin = canonical_origin(origin)
         self._timeout = _timeout(timeout)
+        self._persist = _persist_settings(persist)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._client: httpx.AsyncClient | None = None
         self._closed = False
@@ -103,13 +111,24 @@ class AsyncHTTP:
         if self._client is not None:
             await self._client.aclose()
 
+    def _device_store(
+        self, *, app: str, project: str, environment: str
+    ) -> _DeviceStore:
+        return _device_store(
+            self._origin,
+            app=app,
+            project=project,
+            environment=environment,
+            persist=self._persist,
+        )
+
     def with_bearer(self, token: str) -> ClientTransport:
         if not _valid_token(token):
             raise ClientError("invalid_token")
         return _Authenticated(self, token=token)
 
-    def with_session(self, store: SessionStore) -> ClientTransport:
-        if not isinstance(store, SessionStore):
+    def with_session(self, store: _SessionStore) -> ClientTransport:
+        if not isinstance(store, _SessionStore):
             raise ClientError("invalid_session")
         store._attach("async", self._origin)
         return _Authenticated(self, store=store)
@@ -124,7 +143,7 @@ class AsyncHTTP:
         operation: str,
         payload: bytes | Mapping[str, object],
         token: str | None,
-        store: SessionStore | None,
+        store: _SessionStore | None,
     ) -> object:
         observation = _observer.get()
         if observation is not None:
@@ -167,7 +186,8 @@ class AsyncHTTP:
                                 "both-originals-rejected", {"httpStatus": 401}
                             )
                         await self._refresh(store, snapshot, generation)
-                        latest = store.credentials()
+                        with store._locked():
+                            latest = store._new_credentials(generation)
                         if latest is None:
                             raise failure
                         return await self._attempt(
@@ -184,7 +204,7 @@ class AsyncHTTP:
 
     async def _refresh(
         self,
-        store: SessionStore,
+        store: _SessionStore,
         snapshot: SessionCredentials,
         generation: int,
     ) -> None:
@@ -221,7 +241,7 @@ class AsyncHTTP:
 
     async def _rotate(
         self,
-        store: SessionStore,
+        store: _SessionStore,
         snapshot: SessionCredentials,
         generation: int,
         deadline: float,
@@ -229,6 +249,7 @@ class AsyncHTTP:
         failure: _Failure | None = None
         credentials: SessionCredentials | None = None
         try:
+            store._begin_refresh(snapshot, generation)
             value = await self._attempt(
                 "auth.refresh",
                 _serialize({"refresh_token": snapshot.refresh_token}),
@@ -364,7 +385,7 @@ class _Authenticated:
         owner: AsyncHTTP,
         *,
         token: str | None = None,
-        store: SessionStore | None = None,
+        store: _SessionStore | None = None,
     ) -> None:
         self._owner = owner
         self._token = token

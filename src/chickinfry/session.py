@@ -3,9 +3,9 @@ import re
 import threading
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
-from typing import Literal
+from contextlib import AbstractContextManager, contextmanager
+from dataclasses import asdict, dataclass, field, replace
+from typing import Literal, Protocol, cast, runtime_checkable
 
 from ._conformance import _ClearAttempt, _HookError, _observer
 from ._origin import canonical_origin
@@ -122,6 +122,107 @@ def _refresh_candidate(operation: str, error: ClientError) -> bool:
     )
 
 
+@runtime_checkable
+class _SessionStore(Protocol):
+    _condition: threading.Condition
+    _blocked_generation: int | None
+    _flights: dict[int, asyncio.Task[_Failure | None]]
+    _sync_flights: dict[int, _SyncFlight]
+
+    def _locked(
+        self, deadline: float | None = None
+    ) -> AbstractContextManager[None]: ...
+    def _attach(self, mode: Literal["sync", "async"], origin: str) -> None: ...
+    def credentials(self) -> SessionCredentials | None: ...
+    def replace(self, credentials: SessionCredentials) -> None: ...
+    def clear(self, expected: SessionCredentials) -> None: ...
+    def _register(
+        self, deadline: float | None = None
+    ) -> tuple[SessionCredentials, int]: ...
+    def _current(self, snapshot: SessionCredentials, generation: int) -> bool: ...
+    def _new_credentials(self, generation: int) -> SessionCredentials | None: ...
+    def _begin_refresh(self, snapshot: SessionCredentials, generation: int) -> None: ...
+    def _apply_refresh(
+        self,
+        snapshot: SessionCredentials,
+        generation: int,
+        credentials: SessionCredentials | None,
+        failure: _Failure | None,
+    ) -> None: ...
+    def _release(self, generation: int) -> None: ...
+    def _reclaim(self, generation: int) -> None: ...
+    def _settled(
+        self, generation: int, task: asyncio.Task[_Failure | None]
+    ) -> None: ...
+
+
+class _DeviceSession(Protocol):
+    _auth_generation: int
+    _credentials: SessionCredentials | None
+
+    def _snapshot(self) -> dict[str, object]: ...
+    def _accept_login(
+        self,
+        credentials: SessionCredentials,
+        *,
+        expected_generation: int,
+        user_id: str,
+        screens: tuple[str, ...] = (),
+        expected_auth_generation: int | None = None,
+    ) -> bool: ...
+    def _keep_memory(
+        self,
+        credentials: SessionCredentials,
+        *,
+        persisted_auth_generation: int,
+        persisted_session: object,
+        screens: tuple[str, ...] = (),
+    ) -> None: ...
+
+
+def _commit_device_refresh(
+    store: _DeviceSession,
+    previous: SessionCredentials,
+    auth_generation: int | None,
+    credentials: SessionCredentials,
+) -> None:
+    if auth_generation is None:
+        return
+    try:
+        for _ in range(3):
+            state = store._snapshot()
+            if (
+                state["auth_generation"] != auth_generation
+                or state["session"] != asdict(previous)
+                or state["auth_unknown"]
+            ):
+                raise ClientError("invalid_session")
+            if store._accept_login(
+                credentials,
+                user_id=credentials.user_id,
+                expected_generation=cast(int, state["generation"]),
+                expected_auth_generation=auth_generation,
+            ):
+                return
+        state = store._snapshot()
+        if (
+            state["auth_generation"] != auth_generation
+            or state["session"] != asdict(previous)
+            or state["auth_unknown"]
+        ):
+            raise ClientError("invalid_session")
+    except ClientError as error:
+        if error.reason not in {"device_storage_unavailable", "device_storage_full"}:
+            raise
+    if store._auth_generation != auth_generation or store._credentials != previous:
+        raise ClientError("invalid_session")
+    store._keep_memory(
+        credentials,
+        persisted_auth_generation=auth_generation,
+        persisted_session=asdict(previous),
+    )
+
+
 class SessionStore:
     """An origin-bound store fixed to sync threads or one asyncio loop on attachment."""
 
@@ -228,8 +329,11 @@ class SessionStore:
     def _current(self, snapshot: SessionCredentials, generation: int) -> bool:
         return self._generation == generation and self._credentials is snapshot
 
-    def _new_credentials(self, generation: int) -> bool:
-        return self._generation != generation and self._credentials is not None
+    def _new_credentials(self, generation: int) -> SessionCredentials | None:
+        return self._credentials if self._generation != generation else None
+
+    def _begin_refresh(self, snapshot: SessionCredentials, generation: int) -> None:
+        pass
 
     def _apply_refresh(
         self,

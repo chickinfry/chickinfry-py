@@ -1,6 +1,10 @@
 import re
 
 _MESSAGES = {
+    "device_storage_unavailable": "Could not use device storage for the session. Check that the storage location is writable, or set persist to another directory or turn it off.",
+    "device_storage_corrupt": "Stored session data could not be read. Sign out to clear it, then sign in again.",
+    "device_storage_full": "Device storage for sign-in is full. Finish or cancel pending sign-ups, then try again.",
+    "device_storage_version_unsupported": "Stored session data was written by a newer SDK. Update the SDK, or sign out and sign in again.",
     "invalid_origin": "The server address is invalid; use an HTTPS origin or an explicit IP loopback HTTP origin without a path, query, or fragment.",
     "invalid_operation": "The operation name is invalid; use the operation name defined by your generated client.",
     "invalid_input": "The request data is invalid; provide JSON-compatible values or valid UTF-8 JSON bytes.",

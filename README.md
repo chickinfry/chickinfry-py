@@ -160,3 +160,114 @@ Non-default policy in generated Python applications is not supported yet:
 the CLI's generator wiring and support gate remain separate work. Browser
 cookie sessions are also unsupported. Cookie-only requests are anonymous in
 this native-only runtime; the browser cookie/bearer mixing rule does not apply.
+
+## Device persistence bridge (preview)
+
+The runtime includes a private bridge for generated clients to supply trusted
+app, canonical API origin, project/environment, user and signup-screen context.
+Generated default wiring is integrated separately. Existing explicit
+`SessionStore` injection remains in memory and retains its loop/mode contract.
+
+`HTTP` and `AsyncHTTP` accept `persist` alongside `timeout` and pass it to the
+private context-bound bridge. Explicit `with_session` injection remains caller-owned.
+The bridge accepts `persist=False` for explicit memory-only operation and
+`persist={"dir": path}` for a state directory. Relative directories are resolved once against the
+working directory when the transport is constructed; a later chdir does not
+move the store. An empty string raises `device_storage_unavailable`. Defaults
+never fall back to the working directory. Omission selects Linux
+`XDG_STATE_HOME` (or `HOME/.local/state`), macOS `HOME/Library/Application Support`,
+or Windows `LOCALAPPDATA`. No SQLite, keychain or encryption dependency is used.
+A directory is created lazily with 0700 permissions; an existing directory must
+be owned by the user and not writable by others. Files use 0600; Windows
+uses explicit current-user-only ACLs. Insecure existing permissions, symlinks and
+foreign ownership are rejected. State files are not encrypted.
+
+Each app/origin/project/environment has its own bundle and lock file. A process
+lock serializes generation comparison and replacement. Writes flush a temporary
+file, replace within the same directory, then flush the directory on POSIX.
+Windows holds non-delete-sharing directory handles for every ancestor throughout
+the transaction and rechecks ancestors after file open; unsafe/reparse paths or
+unavailable pinning are refused. Windows skips directory flushing. Native Windows
+execution and power-loss durability remain **UNVERIFIED**; fake API tests do not
+establish real-host support.
+No lock is held over a network call. Storage I/O and an OS lock wait can outlast
+the transport network timeout. Separate sync and async stores use the same
+file contract while keeping transport pools and event-loop state separate.
+Request-scoped `with_bearer` credentials are never stored.
+
+Session replacement, auth-selected attempt cleanup and generation changes are
+one replacement. Refresh consumption-unknown state is durable before sending;
+a crash or lost response never authorizes resending an old refresh. Auth passes
+expired/confirmed screen IDs to `_save_attempt(..., remove_screens=...)`; the
+adapter does not decide expiry with its own clock. Version 1 permits three
+pending attempts and an 8 KiB serialized UTF-8 bundle, without silent eviction.
+Original ISO expiry strings are preserved and range-checked.
+
+A verified server login uses `_accept_login`. If only the following write fails,
+the login succeeds and the new session stays in memory for this run; persistence
+is not promised. Location-creation failures remain configuration errors.
+Restore, pre-refresh and deletion failures are not converted to memory success.
+Corruption and unknown/newer versions preserve the original and block access.
+The existing `ClientError` channel retains `device_storage_unavailable`,
+`device_storage_corrupt`, `device_storage_full`, and
+`device_storage_version_unsupported`, with no fabricated HTTP status.
+
+Core/auth must connect generated defaults, explicit `auth.refresh` pre-send
+claims and conditional transitions. No cache, offline queue or automatic reset
+is implemented. Future cache/queue work must use the same scope and generation
+boundary, and must not store auth requests as queued operations.
+
+After a successful server refresh, local read, lock or write failure during
+commit keeps
+them in this run's memory and the original operation uses its normal single
+retry. The durable in-flight marker remains, so a restart does not resubmit the
+old refresh. Recording that marker must still succeed before any refresh send.
+
+The private auth bridge can read `_snapshot()` and use separate bundle and auth
+generations in a conditional transition. Attempt writes do not advance the auth
+generation; session installs/changes, logout and scoped deletion do. Exact
+attempt-only cleanup preserves the active session and refresh marker. Bounded
+local CAS retries, attempt-reference checks and same-email cleanup selection are
+owned by generated auth integration; the adapter never resends the server RPC.
+
+
+The device bridge records an account-transition-unknown marker before an auth
+bridge sends a login, confirmation, code login or OAuth completion that can
+replace an existing session. It uses the existing conditional transition;
+first login has no previous account to mark. A marker write failure prevents
+the send. A definite auth failure removes the marker and preserves the previous
+account; verified success installs the new session. If only the final write
+fails, the new session remains usable in memory for this run and the marker
+remains durable. On restart, the previous account is not restored, even if its
+best-effort local cleanup fails. Generated auth-method wiring is follow-up work.
+
+POSIX operations stay relative to a validated directory descriptor, including
+locks, temporary writes, replacement and directory flush. Unsafe writable
+ancestors and macOS ACL allow entries are rejected before credentials are
+written. The shared session coordinator retries refresh commits locally at most
+three times while the authentication generation and expected session match;
+it never resends the refresh RPC. Run-local credentials recheck the persisted
+authentication generation before use, including another instance's logout.
+
+
+An E1 memory session retains the authentication generation last read from disk
+when it was accepted. An I/O failure during the pre-call generation check keeps
+that memory session usable. A confirmed generation advance discards it and ends
+that call without adopting another account; later calls use the ordinary store
+read. The existing no-session result is mapped by the generated auth bridge.
+
+A persistent or memory-only device call retains its starting authentication generation through refresh coordination
+and the final retry. A confirmed account change ends that call with
+`invalid_session`, without sending its operation under the new account. The next
+independent call can use the newly stored account. This also fences the fast path
+that reuses credentials refreshed by another caller. Post-success I/O fallback
+never overrides a confirmed account boundary, corrupt data or unsupported format.
+Rereading an attempt-only change preserves the expected session for a pending
+deletion only when both its authentication generation and credentials still match.
+A new authentication generation remains protected even if its credentials match.
+
+File-backed and `persist=False` device sessions use the same bundle transitions,
+refresh commits and account-transition markers; only bundle I/O changes.
+Saving or removing another screen's signup attempt preserves a successful refresh,
+a confirmed 401 deletion and a consumption-unknown block. Later attempt changes
+cannot authorize another send of a consumed or uncertain refresh credential.

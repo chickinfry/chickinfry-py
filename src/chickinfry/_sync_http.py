@@ -7,6 +7,7 @@ from http.cookiejar import CookieJar
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
 from ._conformance import _HookError, _Observation, _observer
+from ._device import _device_store, _DeviceStore, _persist_settings
 from ._http_common import (
     _HEADERS,
     _Body,
@@ -23,10 +24,10 @@ from ._request_state import _RequestState, _state
 from .errors import ClientError, OperationError
 from .session import (
     SessionCredentials,
-    SessionStore,
     _Failure,
     _read_credentials,
     _refresh_candidate,
+    _SessionStore,
     _SyncFlight,
     _valid_token,
 )
@@ -51,10 +52,17 @@ class SyncClientTransport(Protocol):
 class HTTP:
     """An origin-bound synchronous transport with a pool shared safely by threads."""
 
-    def __init__(self, origin: str, *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        origin: str,
+        *,
+        timeout: float = 30.0,
+        persist: bool | Mapping[str, object] = True,
+    ) -> None:
         _check_environment()
         self._origin = canonical_origin(origin)
         self._timeout = _timeout(timeout)
+        self._persist = _persist_settings(persist)
         self._lock = threading.RLock()
         self._closed = False
         self._client: httpx.Client | None = None
@@ -111,15 +119,26 @@ class HTTP:
         if client is not None:
             client.close()
 
+    def _device_store(
+        self, *, app: str, project: str, environment: str
+    ) -> _DeviceStore:
+        return _device_store(
+            self._origin,
+            app=app,
+            project=project,
+            environment=environment,
+            persist=self._persist,
+        )
+
     def with_bearer(self, token: str) -> SyncClientTransport:
         with self._locked():
             if not _valid_token(token):
                 raise ClientError("invalid_token")
             return _Authenticated(self, token=token)
 
-    def with_session(self, store: SessionStore) -> SyncClientTransport:
+    def with_session(self, store: _SessionStore) -> SyncClientTransport:
         with self._locked():
-            if not isinstance(store, SessionStore):
+            if not isinstance(store, _SessionStore):
                 raise ClientError("invalid_session")
         store._attach("sync", self._origin)
         return _Authenticated(self, store=store)
@@ -132,7 +151,7 @@ class HTTP:
         operation: str,
         payload: bytes | Mapping[str, object],
         token: str | None,
-        store: SessionStore | None,
+        store: _SessionStore | None,
     ) -> object:
         observation = _observer.get()
         if observation is not None:
@@ -173,7 +192,7 @@ class HTTP:
                     observation.arrive("both-originals-rejected", {"httpStatus": 401})
                 self._refresh(store, snapshot, generation, deadline)
                 with store._locked(deadline):
-                    latest = store._credentials
+                    latest = store._new_credentials(generation)
                 if latest is None:
                     raise failure
                 return self._attempt(operation, body, latest.access_token, deadline)
@@ -183,7 +202,7 @@ class HTTP:
 
     def _refresh(
         self,
-        store: SessionStore,
+        store: _SessionStore,
         snapshot: SessionCredentials,
         generation: int,
         deadline: float,
@@ -261,7 +280,7 @@ class HTTP:
 
     def _watch_start(
         self,
-        store: SessionStore,
+        store: _SessionStore,
         snapshot: SessionCredentials,
         generation: int,
         flight: _SyncFlight,
@@ -285,7 +304,7 @@ class HTTP:
 
     def _expire_start(
         self,
-        store: SessionStore,
+        store: _SessionStore,
         snapshot: SessionCredentials,
         generation: int,
         flight: _SyncFlight,
@@ -302,7 +321,7 @@ class HTTP:
 
     def _produce(
         self,
-        store: SessionStore,
+        store: _SessionStore,
         snapshot: SessionCredentials,
         generation: int,
         flight: _SyncFlight,
@@ -313,6 +332,7 @@ class HTTP:
         observation = _state.set(flight.request_state)
         registration = _observer.set(hook) if hook is not None else None
         try:
+            store._begin_refresh(snapshot, generation)
             credentials = cast(
                 SessionCredentials,
                 self._attempt(
@@ -338,7 +358,7 @@ class HTTP:
 
     def _publish(
         self,
-        store: SessionStore,
+        store: _SessionStore,
         snapshot: SessionCredentials,
         generation: int,
         flight: _SyncFlight,
@@ -357,7 +377,10 @@ class HTTP:
                         else False,
                     )
                     credentials = None
-                store._apply_refresh(snapshot, generation, credentials, failure)
+                try:
+                    store._apply_refresh(snapshot, generation, credentials, failure)
+                except ClientError as error:
+                    failure = _Failure.from_error(error)
                 flight.result = failure
                 flight.settled = True
             flight.producer_done = True
@@ -492,7 +515,7 @@ class _Authenticated:
         owner: HTTP,
         *,
         token: str | None = None,
-        store: SessionStore | None = None,
+        store: _SessionStore | None = None,
     ) -> None:
         self._owner = owner
         self._token = token
