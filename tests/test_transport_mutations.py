@@ -138,5 +138,6 @@ def test_cancel_then_raw_read_mutation_is_detected(
     )
     output = result.stdout.decode("utf-8", "replace")
     (tmp_path / "mutation-output.txt").write_text(output)
-    assert result.returncode == 1, "M7 escaped the no-read-after-cancel assertion"
+    returncode = result.returncode
+    assert returncode == 1, "M7 escaped the no-read-after-cancel assertion"
     assert "'read'" in output and "Extra items" in output, output
