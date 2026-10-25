@@ -6,8 +6,10 @@ Synchronous and async HTTP transport and in-memory native sessions for
 Chickinfry clients. Requires Python 3.11 or newer. Browser, WebAssembly, and
 Python Worker transports are not supported yet; use a regular Python process.
 
+This preview is not published to PyPI. Install from a local source checkout:
+
 ```sh
-python -m pip install chickinfry
+python -m pip install .
 ```
 
 Use the synchronous transport in scripts and other blocking applications:
@@ -97,13 +99,7 @@ Install development tools with `python -m pip install -r requirements-dev.txt`
 and `python -m pip install --no-deps -e .`. Run `ruff check src tests`,
 `ruff format --check src tests`, and `mypy --strict src tests`.
 
-The root `requirements.txt` pins only the conformance driver's offline
-dependencies. Runtime installation requirements are defined in `pyproject.toml`.
-
-`pytest -q` runs the full suite, including in CI. The sync shared-deadline
-regressions use virtual clocks and observe the remaining socket and
-condition-wait timeouts. Real thread waits only guard liveness; they do not
-establish deadline precision.
+Runtime installation requirements are defined in `pyproject.toml`.
 
 Install the development dependencies and package before running the full suite:
 
