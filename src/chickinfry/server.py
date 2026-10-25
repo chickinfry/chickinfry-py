@@ -123,6 +123,10 @@ class Operation(Generic[Input, Output, C]):
     def prepare(self, value: object) -> Callable[[C], Awaitable[object]]:
         try:
             decoded = self.decode(_input_record(value))
+        except ServerError as error:
+            if error.code == "request_too_large" and error.status == 413:
+                raise
+            raise ServerError("invalid_input", 400) from None
         except Exception:
             raise ServerError("invalid_input", 400) from None
 
