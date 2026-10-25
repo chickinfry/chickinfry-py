@@ -36,6 +36,87 @@ def _read_integer_nullable(value: object) -> _builtins.int | None:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True, repr=False)
+class AppAuthActionTokensRow:
+    attempts: _builtins.int
+    consumed_at: _builtins.str | None
+    created_at: _builtins.str
+    expires_at: _builtins.str
+    id: _builtins.str
+    kind: _builtins.str
+    token_hash: _builtins.str
+    user_id: _builtins.str
+
+
+_app_auth_action_tokens_table = Table(
+    "app_auth_action_tokens",
+    {
+        "attempts": Column[_builtins.int](
+            "attempts",
+            "integer",
+            False,
+        ),
+        "consumed_at": Column[_builtins.str | None](
+            "consumed_at",
+            "timestamp",
+            True,
+        ),
+        "created_at": Column[_builtins.str](
+            "created_at",
+            "timestamp",
+            False,
+        ),
+        "expires_at": Column[_builtins.str](
+            "expires_at",
+            "timestamp",
+            False,
+        ),
+        "id": Column[_builtins.str](
+            "id",
+            "id",
+            False,
+        ),
+        "kind": Column[_builtins.str](
+            "kind",
+            "string",
+            False,
+        ),
+        "token_hash": Column[_builtins.str](
+            "token_hash",
+            "string",
+            False,
+        ),
+        "user_id": Column[_builtins.str](
+            "user_id",
+            "id",
+            False,
+        ),
+    },
+    ("id",),
+    (
+        "expires_at",
+        "kind",
+        "token_hash",
+        "user_id",
+    ),
+)
+
+
+def _decode_app_auth_action_tokens(
+    row: Mapping[_builtins.str, object],
+) -> AppAuthActionTokensRow:
+    return AppAuthActionTokensRow(
+        attempts=_read_integer(row["attempts"]),
+        consumed_at=_read_string_nullable(row["consumed_at"]),
+        created_at=_read_string(row["created_at"]),
+        expires_at=_read_string(row["expires_at"]),
+        id=_read_string(row["id"]),
+        kind=_read_string(row["kind"]),
+        token_hash=_read_string(row["token_hash"]),
+        user_id=_read_string(row["user_id"]),
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True, repr=False)
 class AppAuthIdentitiesRow:
     created_at: _builtins.str
     provider: _builtins.str
@@ -175,6 +256,77 @@ def _decode_app_auth_invites(
         redeemed_at=_read_string_nullable(row["redeemed_at"]),
         redeemed_by=_read_string_nullable(row["redeemed_by"]),
         revoked_at=_read_string_nullable(row["revoked_at"]),
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True, repr=False)
+class AppAuthMigrationsRow:
+    applied_at: _builtins.str
+    digest: _builtins.str
+    feature: _builtins.str
+    name: _builtins.str
+    phase: _builtins.str
+    version: _builtins.int
+
+
+_app_auth_migrations_table = Table(
+    "app_auth_migrations",
+    {
+        "applied_at": Column[_builtins.str](
+            "applied_at",
+            "timestamp",
+            False,
+        ),
+        "digest": Column[_builtins.str](
+            "digest",
+            "string",
+            False,
+        ),
+        "feature": Column[_builtins.str](
+            "feature",
+            "string",
+            False,
+        ),
+        "name": Column[_builtins.str](
+            "name",
+            "string",
+            False,
+        ),
+        "phase": Column[_builtins.str](
+            "phase",
+            "string",
+            False,
+        ),
+        "version": Column[_builtins.int](
+            "version",
+            "integer",
+            False,
+        ),
+    },
+    (
+        "feature",
+        "version",
+    ),
+    (
+        "digest",
+        "feature",
+        "name",
+        "phase",
+        "version",
+    ),
+)
+
+
+def _decode_app_auth_migrations(
+    row: Mapping[_builtins.str, object],
+) -> AppAuthMigrationsRow:
+    return AppAuthMigrationsRow(
+        applied_at=_read_string(row["applied_at"]),
+        digest=_read_string(row["digest"]),
+        feature=_read_string(row["feature"]),
+        name=_read_string(row["name"]),
+        phase=_read_string(row["phase"]),
+        version=_read_integer(row["version"]),
     )
 
 
@@ -396,10 +548,107 @@ def _decode_app_auth_sessions(
 
 
 @dataclass(frozen=True, slots=True, kw_only=True, repr=False)
+class AppAuthSignupRequestsRow:
+    attempts: _builtins.int
+    code_expires_at: _builtins.str
+    code_hash: _builtins.str
+    created_at: _builtins.str
+    email: _builtins.str
+    expires_at: _builtins.str
+    id: _builtins.str
+    invite_id: _builtins.str | None
+    password_hash: _builtins.str
+    updated_at: _builtins.str
+
+
+_app_auth_signup_requests_table = Table(
+    "app_auth_signup_requests",
+    {
+        "attempts": Column[_builtins.int](
+            "attempts",
+            "integer",
+            False,
+        ),
+        "code_expires_at": Column[_builtins.str](
+            "code_expires_at",
+            "timestamp",
+            False,
+        ),
+        "code_hash": Column[_builtins.str](
+            "code_hash",
+            "string",
+            False,
+        ),
+        "created_at": Column[_builtins.str](
+            "created_at",
+            "timestamp",
+            False,
+        ),
+        "email": Column[_builtins.str](
+            "email",
+            "string",
+            False,
+        ),
+        "expires_at": Column[_builtins.str](
+            "expires_at",
+            "timestamp",
+            False,
+        ),
+        "id": Column[_builtins.str](
+            "id",
+            "id",
+            False,
+        ),
+        "invite_id": Column[_builtins.str | None](
+            "invite_id",
+            "id",
+            True,
+        ),
+        "password_hash": Column[_builtins.str](
+            "password_hash",
+            "string",
+            False,
+        ),
+        "updated_at": Column[_builtins.str](
+            "updated_at",
+            "timestamp",
+            False,
+        ),
+    },
+    ("id",),
+    (
+        "code_expires_at",
+        "code_hash",
+        "email",
+        "expires_at",
+        "password_hash",
+    ),
+)
+
+
+def _decode_app_auth_signup_requests(
+    row: Mapping[_builtins.str, object],
+) -> AppAuthSignupRequestsRow:
+    return AppAuthSignupRequestsRow(
+        attempts=_read_integer(row["attempts"]),
+        code_expires_at=_read_string(row["code_expires_at"]),
+        code_hash=_read_string(row["code_hash"]),
+        created_at=_read_string(row["created_at"]),
+        email=_read_string(row["email"]),
+        expires_at=_read_string(row["expires_at"]),
+        id=_read_string(row["id"]),
+        invite_id=_read_string_nullable(row["invite_id"]),
+        password_hash=_read_string(row["password_hash"]),
+        updated_at=_read_string(row["updated_at"]),
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True, repr=False)
 class AppAuthUsersRow:
     created_at: _builtins.str
     disabled_at: _builtins.str | None
     email: _builtins.str
+    email_verified_at: _builtins.str | None
     id: _builtins.str
     password_hash: _builtins.str | None
     session_version: _builtins.int
@@ -422,6 +671,11 @@ _app_auth_users_table = Table(
             "email",
             "string",
             False,
+        ),
+        "email_verified_at": Column[_builtins.str | None](
+            "email_verified_at",
+            "timestamp",
+            True,
         ),
         "id": Column[_builtins.str](
             "id",
@@ -451,6 +705,7 @@ def _decode_app_auth_users(
         created_at=_read_string(row["created_at"]),
         disabled_at=_read_string_nullable(row["disabled_at"]),
         email=_read_string(row["email"]),
+        email_verified_at=_read_string_nullable(row["email_verified_at"]),
         id=_read_string(row["id"]),
         password_hash=_read_string_nullable(row["password_hash"]),
         session_version=_read_integer(row["session_version"]),
@@ -459,6 +714,11 @@ def _decode_app_auth_users(
 
 class Database:
     def __init__(self, port: DatabasePort) -> None:
+        self.action_tokens = Repository(
+            port,
+            _app_auth_action_tokens_table,
+            _decode_app_auth_action_tokens,
+        )
         self.identities = Repository(
             port,
             _app_auth_identities_table,
@@ -468,6 +728,11 @@ class Database:
             port,
             _app_auth_invites_table,
             _decode_app_auth_invites,
+        )
+        self.migrations = Repository(
+            port,
+            _app_auth_migrations_table,
+            _decode_app_auth_migrations,
         )
         self.rate_limits = Repository(
             port,
@@ -483,6 +748,11 @@ class Database:
             port,
             _app_auth_sessions_table,
             _decode_app_auth_sessions,
+        )
+        self.signup_requests = Repository(
+            port,
+            _app_auth_signup_requests_table,
+            _decode_app_auth_signup_requests,
         )
         self.users = Repository(
             port,
