@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
         ("httpx", "async", 302),
         ("peak", "sync", 302),
         ("peak", "async", 302),
+        ("identity", "sync", 200),
     ],
 )
 def test_missing_storage_is_a_numeric_census_failure(
@@ -41,7 +42,10 @@ def test_missing_storage_is_a_numeric_census_failure(
     shutil.copyfile(ROOT / "pyproject.toml", source / "pyproject.toml")
     path = source / "conformance/driver/transport.py"
     text = path.read_text()
-    if role == "peak":
+    if role == "identity":
+        original = "                storage.pop(id(value), None)"
+        mutation = "                pass"
+    elif role == "peak":
         original = "self.peak = max(self.peak, self.retained)"
         mutation = "self.peak = self.retained"
     else:
@@ -56,6 +60,8 @@ def test_missing_storage_is_a_numeric_census_failure(
     node = f"tests/test_transport_census.py::test_live_redirect_byte_census[False-{status}-8191-{environment}]"
     if role == "httpx":
         node = f"tests/test_transport_census.py::test_httpx_completed_store_census[{environment}]"
+    elif role == "identity":
+        node = "tests/test_transport_census.py::test_reused_body_copy_identity_updates_the_current_census[plain]"
     result = subprocess.run(
         [
             sys.executable,
@@ -89,7 +95,12 @@ def test_missing_storage_is_a_numeric_census_failure(
         )
         assert mismatch is not None, "No exact retained-byte mismatch was reported"
         assert int(mismatch[2]) - int(mismatch[1]) == int(mismatch[3])
-        assert int(mismatch[3]) in {4093, 8191}, "The omitted positive storage changed"
+        if role == "identity":
+            assert int(mismatch[3]) == -57195, "The stale first-chunk count changed"
+        else:
+            assert int(mismatch[3]) in {4093, 8191}, (
+                "The omitted positive storage changed"
+            )
 
 
 @pytest.mark.parametrize("environment", ["python-sync", "python-async"])

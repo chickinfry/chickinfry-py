@@ -464,6 +464,40 @@ async def test_transport_allocation_crosscheck(
             tracemalloc.stop()
 
 
+@pytest.mark.parametrize("registry", ["plain", "spans"])
+async def test_reused_body_copy_identity_updates_the_current_census(
+    registry: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    original = Transport.sample
+    reused = 0
+
+    def sampled(
+        self: Transport,
+        frame: FrameType,
+        returned: object = None,
+        ingress: bool = False,
+    ) -> None:
+        nonlocal reused
+        if (
+            frame.f_code.co_name == "_receive_response_body"
+            and isinstance(returned, bytes)
+            and len(returned) == 8247
+        ):
+            # Model the last copy reusing a freed first-chunk address.
+            if registry == "plain":
+                self.plain[id(returned)] = 65442
+            else:
+                self.spans[id(returned)] = (0, 65536)
+            reused += 1
+        original(self, frame, returned, ingress)
+
+    monkeypatch.setattr(Transport, "sample", sampled)
+    await test_live_redirect_byte_census(
+        "sync", 73689, 200, True, monkeypatch, tmp_path
+    )
+    assert reused == 1, "The last body copy was not observed"
+
+
 @pytest.mark.parametrize("environment", ["sync", "async"])
 async def test_httpx_completed_store_census(
     environment: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
