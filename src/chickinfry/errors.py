@@ -1,5 +1,8 @@
 import re
 
+from ._error_details import FieldError as FieldError
+from ._error_details import _fields, _message
+
 _MESSAGES = {
     "device_storage_unavailable": "Could not use device storage for the session. Check that the storage location is writable, or set persist to another directory or turn it off.",
     "device_storage_corrupt": "Stored session data could not be read. Sign out to clear it, then sign in again.",
@@ -38,10 +41,18 @@ class ClientError(Exception):
 class OperationError(ClientError):
     """A server operation failure retaining its wire code and HTTP status."""
 
-    def __init__(self, code: str, status: int) -> None:
+    def __init__(
+        self,
+        code: str,
+        status: int,
+        message: str | None = None,
+        fields: tuple[FieldError, ...] = (),
+    ) -> None:
         self.code = code if re.fullmatch(r"[a-z_]+", code) else "operation_failed"
         self.reason = "operation_failed"
         self.status = status
+        self.response_message = _message(message)
+        self.fields = _fields(fields) if self.code == "invalid_input" else ()
         self._outcome_unknown = False
         self._valid_error_envelope = True
         Exception.__init__(self, _MESSAGES[self.reason])
