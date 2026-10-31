@@ -16,15 +16,16 @@ import pytest
 
 from chickinfry._auth_database import Database, create_database
 from chickinfry.auth import Auth
-from chickinfry.errors import OperationError
+from chickinfry.errors import OperationError as ReceivedOperationError
 from chickinfry.orm import format_timestamp, parse_timestamp
 from chickinfry.server import (
     Application,
+    FieldError,
     Operation,
+    OperationError,
     Request,
     RequestInfo,
     RequestScope,
-    ServerError,
     Session,
     _Body,
     _Bytes,
@@ -198,12 +199,14 @@ async def test_deferred_decode_receives_raw_input_before_session_guard(
     received: list[object] = []
 
     class ProtectedOperation:
+        input_fields = operation.input_fields
+
         def prepare(self, value: object) -> Callable[[_Scope], Awaitable[object]]:
             received.append(value)
 
             async def run(context: _Scope) -> object:
                 if context.session is None:
-                    raise ServerError("unauthenticated", 401)
+                    raise OperationError("unauthenticated", 401)
                 return await operation.prepare(value)(context)
 
             return run
@@ -223,7 +226,12 @@ async def test_streamed_utf8_request_boundary(size: int, status: int) -> None:
     probe = Probe()
     prefix, suffix = b'{"wire_value":"', b'"}'
     count = size - len(prefix) - len(suffix)
-    body = prefix + "한🎉".encode() * (count // 7) + b"x" * (count % 7) + suffix
+    body = (
+        prefix
+        + "\ud55c\U0001f389".encode() * (count // 7)
+        + b"x" * (count % 7)
+        + suffix
+    )
     request = BytesRequest(
         [body[:100], body[100:4194304], body[4194304:], b" "]
         if status == 413
@@ -246,13 +254,26 @@ async def test_streamed_utf8_request_boundary(size: int, status: int) -> None:
     "failure,status,code",
     [
         (ValueError("private detail"), 500, "operation_failed"),
-        (OperationError("permission_denied", 403), 500, "operation_failed"),
-        (ServerError("permission_denied", 403), 403, "permission_denied"),
-        (ServerError("unsafe detail", 403), 500, "operation_failed"),
-        (ServerError("too_long_" * 9, 403), 500, "operation_failed"),
-        (ServerError("permission_denied", 418), 500, "operation_failed"),
+        (ReceivedOperationError("permission_denied", 403), 500, "operation_failed"),
+        (OperationError("permission_denied", 403), 403, "permission_denied"),
+        (OperationError("unsafe detail", 403), 500, "operation_failed"),
+        (OperationError("too_long_" * 9, 403), 500, "operation_failed"),
+        (OperationError("permission_denied", 418), 418, "permission_denied"),
+        (OperationError("x", 422), 422, "x"),
+        (OperationError("x", 400), 400, "x"),
+        (OperationError("x", 599), 599, "x"),
+        (OperationError("x", 399), 500, "operation_failed"),
+        (OperationError("x", 600), 500, "operation_failed"),
+        (OperationError("x", cast(int, True)), 500, "operation_failed"),
+        (OperationError("x", cast(int, False)), 500, "operation_failed"),
+        (OperationError("x", cast(int, "422")), 500, "operation_failed"),
+        (OperationError("x", cast(int, 422.0)), 500, "operation_failed"),
+        (OperationError("x", cast(int, None)), 500, "operation_failed"),
+        (OperationError("x", cast(int, float("nan"))), 500, "operation_failed"),
+        (OperationError("x", cast(int, float("inf"))), 500, "operation_failed"),
+        (OperationError("x\n", 422), 500, "operation_failed"),
         pytest.param(
-            ServerError("not_implemented", 501),
+            OperationError("not_implemented", 501),
             501,
             "not_implemented",
             id="catches_explicit_501_downgrade_or_changed_body",
@@ -264,10 +285,10 @@ async def test_streamed_utf8_request_boundary(size: int, status: int) -> None:
             id="catches_builtin_not_implemented_promoted_to_501",
         ),
         pytest.param(
-            ServerError("other_code", 501),
-            500,
-            "operation_failed",
-            id="catches_other_code_allowed_at_501",
+            OperationError("other_code", 501),
+            501,
+            "other_code",
+            id="preserves_custom_code_at_501",
         ),
     ],
 )
@@ -276,11 +297,171 @@ async def test_error_boundary(failure: Exception, status: int, code: str) -> Non
     probe.failure = failure
     response = await probe.app().fetch(BytesRequest([b'{"wire_value":"ok"}']))
     assert response.status == status and json.loads(response.body) == {"error": code}
-    if status == 501:
-        assert response.body == b'{"error":"not_implemented"}'
     assert probe.opened == probe.closed == 1
     assert response.headers["Cache-Control"] == "no-store"
     assert not any(name.lower() == "set-cookie" for name in response.headers)
+
+
+@pytest.mark.parametrize("message", [None, "", "Quantity must be 10 or less."])
+async def test_error_message(message: str | None) -> None:
+    probe = Probe()
+    probe.failure = OperationError("x", 422, message)
+    response = await probe.app().fetch(BytesRequest([b'{"wire_value":"ok"}']))
+    expected: dict[str, object] = {"error": "x"}
+    if message is not None:
+        expected["message"] = message
+    assert response.status == 422 and json.loads(response.body) == expected
+    assert str(probe.failure) == "Operation failed."
+
+
+@pytest.mark.parametrize(
+    "message,fields,declared,code,status,expected",
+    [
+        (
+            "Safe",
+            (FieldError("wire_value", "too_large"),),
+            frozenset({"wire_value"}),
+            "invalid_input",
+            422,
+            {
+                "error": "invalid_input",
+                "message": "Safe",
+                "fields": [{"path": "wire_value", "code": "too_large"}],
+            },
+        ),
+        (
+            "Safe",
+            (FieldError("wire_value", "too_large"),),
+            frozenset(),
+            "invalid_input",
+            422,
+            {"error": "invalid_input", "message": "Safe"},
+        ),
+        (
+            "Safe",
+            (FieldError("unknown", "too_large"),),
+            frozenset({"wire_value"}),
+            "invalid_input",
+            422,
+            {"error": "invalid_input", "message": "Safe"},
+        ),
+        (
+            "Safe",
+            (FieldError("wire_value", "too_large"),),
+            frozenset({"wire_value"}),
+            "x",
+            422,
+            {"error": "x", "message": "Safe"},
+        ),
+        (
+            "Safe",
+            (FieldError("wire_value", "too_large"),),
+            frozenset({"wire_value"}),
+            "invalid_input",
+            600,
+            {"error": "operation_failed"},
+        ),
+        (
+            "bad\nmessage",
+            (FieldError("wire_value", "too_large"),),
+            frozenset({"wire_value"}),
+            "invalid_input",
+            422,
+            {
+                "error": "invalid_input",
+                "fields": [{"path": "wire_value", "code": "too_large"}],
+            },
+        ),
+        (
+            "Safe",
+            (FieldError("wire_value", "bad\n"),),
+            frozenset({"wire_value"}),
+            "invalid_input",
+            422,
+            {"error": "invalid_input", "message": "Safe"},
+        ),
+    ],
+)
+async def test_error_details(
+    message: str,
+    fields: tuple[FieldError, ...],
+    declared: frozenset[str],
+    code: str,
+    status: int,
+    expected: dict[str, object],
+) -> None:
+    probe = Probe()
+    probe.failure = OperationError(code, status, message, fields)
+    app = Application(
+        {"probe.echo": Operation(decode, probe.invoke, encode, declared)}, probe.open
+    )
+    response = await app.fetch(BytesRequest([b'{"wire_value":"ok"}']))
+    assert response.status == (500 if status == 600 else status)
+    assert json.loads(response.body) == expected
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["a" * 1025, "\ud800", "\x00", "\x7f", "\x85", "\u2028", "\u2029", cast(str, 42)],
+)
+async def test_invalid_error_message_is_omitted(message: str) -> None:
+    probe = Probe()
+    probe.failure = OperationError("x", 422, message)
+    response = await probe.app().fetch(BytesRequest([b'{"wire_value":"ok"}']))
+    assert response.status == 422 and json.loads(response.body) == {"error": "x"}
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        (FieldError("wire_value", "too_large"),) * 33,
+        (FieldError("wire_value", ""),),
+        (FieldError("wire_value", "x" * 65),),
+        (FieldError("wire_value", "INVALID"),),
+        (FieldError("wire_value", "bad1"),),
+        (FieldError("wire_value", "ok"), FieldError("wire_value", "bad\n")),
+        cast(tuple[FieldError, ...], "wrong"),
+        cast(
+            tuple[FieldError, ...],
+            ({"path": "wire_value", "code": "ok", "value": "private"},),
+        ),
+    ],
+)
+async def test_invalid_field_list_is_discarded_atomically(
+    fields: tuple[FieldError, ...],
+) -> None:
+    probe = Probe()
+    probe.failure = OperationError("invalid_input", 422, "Safe", fields)
+    app = Application(
+        {
+            "probe.echo": Operation(
+                decode, probe.invoke, encode, frozenset({"wire_value"})
+            )
+        },
+        probe.open,
+    )
+    response = await app.fetch(BytesRequest([b'{"wire_value":"ok"}']))
+    assert response.status == 422
+    assert json.loads(response.body) == {"error": "invalid_input", "message": "Safe"}
+
+
+async def test_error_optional_limits_are_inclusive() -> None:
+    probe = Probe()
+    message = "\u00e9" * 512
+    fields = (FieldError("wire_value", "x" * 64),) * 32
+    probe.failure = OperationError("invalid_input", 422, message, fields)
+    app = Application(
+        {
+            "probe.echo": Operation(
+                decode, probe.invoke, encode, frozenset({"wire_value"})
+            )
+        },
+        probe.open,
+    )
+    response = await app.fetch(BytesRequest([b'{"wire_value":"ok"}']))
+    body = json.loads(response.body)
+    assert response.status == 422 and body["message"] == message
+    assert body["fields"] == [{"path": "wire_value", "code": "x" * 64}] * 32
 
 
 async def test_routes_cors_and_auth_before_handler() -> None:
@@ -326,11 +507,11 @@ async def test_routes_cors_and_auth_before_handler() -> None:
     assert success.status == 200
     assert not any(name.lower() == "set-cookie" for name in success.headers)
 
-    probe.failure = ServerError("not_implemented", 501)
+    probe.failure = OperationError("not_implemented", 501)
 
     async def protected(context: _Scope, text: str) -> Mapping[str, object]:
         if context.session is None:
-            raise ServerError("unauthenticated", 401)
+            raise OperationError("unauthenticated", 401)
         return await probe.invoke(context, text)
 
     protected_app = Application(
@@ -412,7 +593,7 @@ async def test_auth_session_effective_expiry(
 
     async def session(context: _Scope, value: Mapping[str, object]) -> Session:
         if context.session is None:
-            raise ServerError("unauthenticated", 401)
+            raise OperationError("unauthenticated", 401)
         return context.session
 
     def encode_session(value: Session) -> Mapping[str, object]:
@@ -827,3 +1008,126 @@ async def test_workers_failed_setup_releases_requests(
     assert not isinstance(state, BaseException)
     for name in ("__traceback__", "__cause__", "__context__"):
         assert getattr(state, name, None) is None
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["path", "message", "fields", "declarations", "metadata_none", "metadata_list"],
+)
+async def test_error_boundary_uses_plain_value_snapshots(kind: str) -> None:
+    class FakePath(str):
+        def __hash__(self) -> int:
+            return hash("wire_value")
+
+        def __eq__(self, other: object) -> bool:
+            return True
+
+    class ShortEncoding(str):
+        def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+            return b"x"
+
+    class FakeCount(tuple[FieldError, ...]):
+        def __len__(self) -> int:
+            return 0
+
+    class FakeDeclarations(frozenset[str]):
+        def __contains__(self, value: object) -> bool:
+            return True
+
+    declared: frozenset[str] = frozenset({"wire_value"})
+    fields: tuple[FieldError, ...] = (FieldError("wire_value", "required"),)
+    message = "Safe"
+    expected: dict[str, object] = {"error": "invalid_input", "message": "Safe"}
+    if kind == "path":
+        fields = (FieldError(FakePath("undeclared"), "required"),)
+    elif kind == "message":
+        message = ShortEncoding("x" * 1025)
+        expected = {
+            "error": "invalid_input",
+            "fields": [{"path": "wire_value", "code": "required"}],
+        }
+    elif kind == "fields":
+        fields = FakeCount(fields * 33)
+    elif kind == "declarations":
+        declared = FakeDeclarations({"wire_value"})
+        fields = (FieldError("undeclared", "required"),)
+    elif kind == "metadata_none":
+        declared = cast(frozenset[str], None)
+    else:
+        declared = cast(frozenset[str], ["wire_value"])
+    probe = Probe()
+    probe.failure = OperationError("invalid_input", 422, message, fields)
+    app = Application(
+        {"probe.echo": Operation(decode, probe.invoke, encode, declared)}, probe.open
+    )
+    response = await app.fetch(BytesRequest([b'{"wire_value":"ok"}']))
+    assert response.status == 422 and json.loads(response.body) == expected
+    assert probe.closed == 1
+
+
+@pytest.mark.parametrize("attribute", ["code", "status", "message", "fields"])
+@pytest.mark.parametrize("mode", ["deleted", "raises"])
+async def test_error_boundary_contains_attribute_failures(
+    attribute: str, mode: str
+) -> None:
+    class BrokenError(OperationError):
+        def __getattribute__(self, name: str) -> object:
+            if mode == "raises" and name == attribute:
+                raise RuntimeError("private detail")
+            return super().__getattribute__(name)
+
+    error = BrokenError(
+        "invalid_input", 422, "Safe", (FieldError("wire_value", "required"),)
+    )
+    if mode == "deleted":
+        delattr(error, attribute)
+    probe = Probe()
+    probe.failure = error
+    app = Application(
+        {
+            "probe.echo": Operation(
+                decode, probe.invoke, encode, frozenset({"wire_value"})
+            )
+        },
+        probe.open,
+    )
+    response = await app.fetch(BytesRequest([b'{"wire_value":"ok"}']))
+    expected: dict[str, object] = {"error": "invalid_input"}
+    if attribute in {"code", "status"}:
+        expected = {"error": "operation_failed"}
+        assert response.status == 500
+    else:
+        assert response.status == 422
+        if attribute != "message":
+            expected["message"] = "Safe"
+        if attribute != "fields":
+            expected["fields"] = [{"path": "wire_value", "code": "required"}]
+    assert json.loads(response.body) == expected and probe.closed == 1
+
+
+async def test_error_boundary_contains_serialization_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("private detail")
+
+    probe = Probe()
+    probe.failure = OperationError("x", 422, "Safe")
+    monkeypatch.setattr("chickinfry.server.json.dumps", fail)
+    response = await probe.app().fetch(BytesRequest([b'{"wire_value":"ok"}']))
+    assert response.status == 500 and response.body == b'{"error":"operation_failed"}'
+    assert probe.closed == 1
+
+
+async def test_error_detail_cancellation_still_propagates() -> None:
+    class CancelledDetail(OperationError):
+        def __getattribute__(self, name: str) -> object:
+            if name == "message":
+                raise asyncio.CancelledError
+            return super().__getattribute__(name)
+
+    probe = Probe()
+    probe.failure = CancelledDetail("x", 422)
+    with pytest.raises(asyncio.CancelledError):
+        await probe.app().fetch(BytesRequest([b'{"wire_value":"ok"}']))
+    assert probe.closed == 1

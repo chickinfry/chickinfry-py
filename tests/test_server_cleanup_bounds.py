@@ -16,7 +16,7 @@ from chickinfry._auth_database import create_database
 from chickinfry.auth import Auth, CleanupContext, hash_token, random_token
 from chickinfry.orm import DatabasePort, format_timestamp
 from chickinfry.postgres import PostgresPort
-from chickinfry.server import ServerError
+from chickinfry.server import OperationError
 
 from .server_fixture import Harness
 
@@ -279,12 +279,12 @@ async def test_cleanup_progress_past_preserved_credentials_and_legacy_families(
     assert len(survivors) == 1 and survivors[0].id == initial.session_id
     assert not any(row.id in dead for row in survivors)
     assert len(await private.refresh_tokens.find_many()) == 103
-    with pytest.raises(ServerError) as reused:
+    with pytest.raises(OperationError) as reused:
         await core.refresh(initial.refresh_token)
     assert reused.value.code == "session_revoked"
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.session(newest.access_token)
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.refresh(newest.refresh_token)
 
 
@@ -300,7 +300,7 @@ async def test_cleanup_growth_rejects_expired_refresh_and_eventually_selects_fam
     private = PrivateDatabase(db.port())
     grown = Auth(db.port(), create_database, now=db.now, idle_timeout_seconds=7200)
     db.instant = started + timedelta(seconds=3600, microseconds=1)
-    with pytest.raises(ServerError) as expired:
+    with pytest.raises(OperationError) as expired:
         await grown.refresh(probe.refresh_token)
     assert expired.value.status == 401 and expired.value.code == "session_revoked"
     # The rejection revokes its probe; keep the untouched family for candidate checks.
@@ -522,7 +522,7 @@ async def test_cleanup_shrink_progress_past_full_candidate_batch(
 
     for access, refresh in credentials:
         for reject in (shrunk.session(access), shrunk.refresh(refresh)):
-            with pytest.raises(ServerError) as expired:
+            with pytest.raises(OperationError) as expired:
                 await reject
             assert expired.value.status == 401
     for _ in range(2):

@@ -31,7 +31,7 @@ from .orm import (
     or_,
     parse_timestamp,
 )
-from .server import ServerError, Session, User
+from .server import OperationError, Session, User
 
 R_co = TypeVar("R_co", covariant=True)
 T = TypeVar("T")
@@ -258,7 +258,7 @@ def _canonical(value: str) -> bool:
 
 def _validate_token(value: str) -> None:
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", value):
-        raise ServerError("invalid_token", 401)
+        raise OperationError("invalid_token", 401)
 
 
 def _valid_email_format(email: str) -> bool:
@@ -273,14 +273,14 @@ def _valid_email_format(email: str) -> bool:
 
 def normalize_email(value: str) -> str:
     if not isinstance(value, str):
-        raise ServerError("invalid_input", 400)
+        raise OperationError("invalid_input", 400)
     email = value.strip(_EMAIL_WHITESPACE).lower()
     if (
         "\0" in email
         or len(email.encode("utf-16-le", "surrogatepass")) // 2 > 320
         or not _valid_email_format(email)
     ):
-        raise ServerError("invalid_input", 400)
+        raise OperationError("invalid_input", 400)
     return email
 
 
@@ -293,7 +293,7 @@ def validate_password(value: str) -> None:
         ):
             raise ValueError
     except (ValueError, UnicodeError):
-        raise ServerError("invalid_input", 400) from None
+        raise OperationError("invalid_input", 400) from None
 
 
 def _filter(
@@ -310,7 +310,7 @@ def _invite_id(value: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(
         r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value
     ):
-        raise ServerError("invalid_input", 400)
+        raise OperationError("invalid_input", 400)
     return value.lower()
 
 
@@ -383,7 +383,7 @@ class Auth:
             {"session_version": user.session_version},
         )
         if current is None:
-            raise ServerError("invalid_credentials", 401)
+            raise OperationError("invalid_credentials", 401)
         access, refresh = random_token(), random_token()
         issued = self.now()
         expiry = format_timestamp(issued + timedelta(seconds=900))
@@ -465,7 +465,7 @@ class Auth:
             try:
                 await self.hooks.user_creating(port, public)
             except Exception:
-                raise ServerError("user_creation_failed", 500) from None
+                raise OperationError("user_creation_failed", 500) from None
         return public
 
     async def _created(self, user: AuthUser) -> None:
@@ -473,13 +473,13 @@ class Auth:
             try:
                 await self.hooks.user_created(user)
             except Exception:
-                raise ServerError("user_created_effect_failed", 500) from None
+                raise OperationError("user_created_effect_failed", 500) from None
 
     async def signup(self, email: str, password: str, invite_code: str = "") -> Tokens:
         email = normalize_email(email)
         validate_password(password)
         if not isinstance(invite_code, str):
-            raise ServerError("invalid_input", 400)
+            raise OperationError("invalid_input", 400)
         await self._rate_limit("signup", email)
         if self.signup_policy == "invite-only":
             await self._check_invite(self.db, email, invite_code)
@@ -503,7 +503,7 @@ class Auth:
             tokens, public = await self.port.transaction(work)
         except Exception as error:
             if _unique(error):
-                raise ServerError("account_exists", 409) from None
+                raise OperationError("account_exists", 409) from None
             raise
         await self._created(public)
         self._schedule_cleanup()
@@ -521,7 +521,7 @@ class Auth:
             password, user.password_hash if user is not None else None, self._kdf
         )
         if not matched or user is None or user.disabled_at is not None:
-            raise ServerError("invalid_credentials", 401)
+            raise OperationError("invalid_credentials", 401)
 
         async def issue(port: DatabasePort) -> Tokens:
             return await self._issue(self.create_database(port), user)
@@ -534,22 +534,22 @@ class Auth:
         self, provider_id: str, credential: object, invite_code: str = ""
     ) -> Tokens:
         if not isinstance(invite_code, str):
-            raise ServerError("invalid_input", 400)
+            raise OperationError("invalid_input", 400)
         provider = self.providers.get(provider_id)
         if provider is None:
-            raise ServerError("unsupported_identity_provider", 400)
+            raise OperationError("unsupported_identity_provider", 400)
         await self._rate_limit("identity_attempt", provider_id, 100, 60)
         try:
             identity = await provider.verify(credential)
         except Exception:
-            raise ServerError("invalid_credentials", 401) from None
+            raise OperationError("invalid_credentials", 401) from None
         email = normalize_email(identity.verified_email)
         if (
             not isinstance(identity.subject, str)
             or not identity.subject
             or len(identity.subject) > 2048
         ):
-            raise ServerError("invalid_credentials", 401)
+            raise OperationError("invalid_credentials", 401)
         await self._rate_limit("identity", provider_id + ":" + identity.subject)
         key = {"provider": provider_id, "subject": identity.subject}
         if (
@@ -573,7 +573,7 @@ class Auth:
                 else await db.users.insert({"email": email, "password_hash": None})
             )
             if user is None or user.disabled_at is not None:
-                raise ServerError("invalid_credentials", 401)
+                raise OperationError("invalid_credentials", 401)
             public = None
             if stored is None:
                 if invite is not None:
@@ -589,7 +589,7 @@ class Auth:
             tokens, public = await self.port.transaction(work)
         except Exception as error:
             if _unique(error):
-                raise ServerError("identity_conflict", 409) from None
+                raise OperationError("identity_conflict", 409) from None
             raise
         if public is not None:
             await self._created(public)
@@ -604,7 +604,7 @@ class Auth:
             or record.transport != "native"
             or record.revoked_at is not None
         ):
-            raise ServerError("invalid_token", 401)
+            raise OperationError("invalid_token", 401)
         user = await self._lock_user(db, record)
         instant = self.now()
         family = await self._family_expiry(db, record)
@@ -614,7 +614,7 @@ class Auth:
             or family is None
             or family <= instant
         ):
-            raise ServerError("invalid_token", 401)
+            raise OperationError("invalid_token", 401)
         return Session(
             record.id,
             User(user.id, user.email),
@@ -666,7 +666,7 @@ class Auth:
             limit=1,
         )
         if not rows:
-            raise ServerError("invalid_token", 401)
+            raise OperationError("invalid_token", 401)
         stored = rows[0]
 
         async def consume(port: DatabasePort) -> Tokens | None:
@@ -731,7 +731,7 @@ class Auth:
 
         outcome = await self.port.transaction(consume)
         if outcome is None:
-            raise ServerError("session_revoked", 401)
+            raise OperationError("session_revoked", 401)
         self._schedule_cleanup()
         return outcome
 
@@ -739,9 +739,9 @@ class Auth:
         self, db: AuthDatabase, email: str, code: str
     ) -> InviteRecord:
         if not code:
-            raise ServerError("invite_required", 403)
+            raise OperationError("invite_required", 403)
         if not _canonical(code):
-            raise ServerError("invite_invalid", 403)
+            raise OperationError("invite_invalid", 403)
         rows = await db.invites.find_many(
             where=_filter(db.invites, "code_hash", "=", hash_token(code)), limit=1
         )
@@ -754,7 +754,7 @@ class Auth:
             or row.revoked_at is not None
             or parse_timestamp(row.expires_at) <= self.now()
         ):
-            raise ServerError("invite_invalid", 403)
+            raise OperationError("invite_invalid", 403)
         return row
 
     async def _lock_invite(
@@ -777,7 +777,7 @@ class Auth:
             {"expires_at": row.expires_at},
         )
         if locked is None or parse_timestamp(locked.expires_at) <= self.now():
-            raise ServerError("invite_invalid", 403)
+            raise OperationError("invite_invalid", 403)
         return locked
 
     async def _rate_limit(
@@ -799,7 +799,7 @@ class Auth:
                 continue
             expired = parse_timestamp(row.expires_at) <= self.now()
             if not expired and row.attempt_count >= maximum:
-                raise ServerError("rate_limited", 429)
+                raise OperationError("rate_limited", 429)
             updated = await self.db.rate_limits.update_if(
                 key,
                 and_(
@@ -815,13 +815,13 @@ class Auth:
             )
             if updated is not None:
                 return
-        raise ServerError("rate_limited", 429)
+        raise OperationError("rate_limited", 429)
 
     async def _manage(
         self, access: str, work: Callable[[AuthDatabase, Session], Awaitable[T]]
     ) -> T:
         if self.signup_policy != "invite-only":
-            raise ServerError("not_found", 404)
+            raise OperationError("not_found", 404)
         _validate_token(access)
 
         async def run(port: DatabasePort) -> T:
@@ -829,19 +829,19 @@ class Auth:
             session = await self._lock_session(db, access)
             actor = await self._validate_session(db, session)
             if self.hooks.invite_managing is None:
-                raise ServerError("permission_denied", 403)
+                raise OperationError("permission_denied", 403)
             if self.project_id is None:
-                raise ServerError("service_unavailable", 503)
+                raise OperationError("service_unavailable", 503)
             try:
                 project = _invite_id(self.project_id)
-            except ServerError:
-                raise ServerError("service_unavailable", 503) from None
+            except OperationError:
+                raise OperationError("service_unavailable", 503) from None
             try:
                 await self.hooks.invite_managing(port, actor, project)
-            except ServerError:
+            except OperationError:
                 raise
             except Exception:
-                raise ServerError("permission_denied", 403) from None
+                raise OperationError("permission_denied", 403) from None
             return await work(db, actor)
 
         result = await self.port.transaction(run)
@@ -852,7 +852,7 @@ class Auth:
         if (row.redeemed_at is None) != (row.redeemed_by is None) or (
             row.redeemed_at is not None and row.revoked_at is not None
         ):
-            raise ServerError("operation_failed", 500)
+            raise OperationError("operation_failed", 500)
         status = (
             "redeemed"
             if row.redeemed_at is not None
@@ -875,7 +875,7 @@ class Auth:
 
         async def issue(db: AuthDatabase, actor: Session) -> Mapping[str, str]:
             if await db.invites.find_by_id({"id": id}) is not None:
-                raise ServerError("invite_issue_replayed", 409)
+                raise OperationError("invite_issue_replayed", 409)
             code = random_token()
             issued = self.now()
             row = await db.invites.insert(
@@ -897,13 +897,13 @@ class Auth:
                 _unique(error)
                 and await self.db.invites.find_by_id({"id": id}) is not None
             ):
-                raise ServerError("invite_issue_replayed", 409) from None
+                raise OperationError("invite_issue_replayed", 409) from None
             raise
 
     async def invite_list(self, access: str, cursor: str) -> Mapping[str, object]:
         after: tuple[str, str] | None = None
         if not isinstance(cursor, str):
-            raise ServerError("invalid_input", 400)
+            raise OperationError("invalid_input", 400)
         if cursor:
             try:
                 if len(cursor) > 512 or not re.fullmatch(r"[A-Za-z0-9_-]+", cursor):
@@ -921,8 +921,8 @@ class Auth:
                 ):
                     raise ValueError
                 after = value[0], _invite_id(value[1])
-            except (ValueError, ServerError):
-                raise ServerError("invalid_input", 400) from None
+            except (ValueError, OperationError):
+                raise OperationError("invalid_input", 400) from None
 
         async def page(db: AuthDatabase, actor: Session) -> Mapping[str, object]:
             where = (
@@ -964,17 +964,17 @@ class Auth:
         async def revoke(db: AuthDatabase, actor: Session) -> Mapping[str, str]:
             candidate = await db.invites.find_by_id({"id": id})
             if candidate is None:
-                raise ServerError("not_found", 404)
+                raise OperationError("not_found", 404)
             row = await db.invites.update_if(
                 {"id": id},
                 _filter(db.invites, "expires_at", "=", candidate.expires_at),
                 {"expires_at": candidate.expires_at},
             )
             if row is None:
-                raise ServerError("not_found", 404)
+                raise OperationError("not_found", 404)
             status = self._summary(row)["status"]
             if status == "redeemed":
-                raise ServerError("invite_already_redeemed", 409)
+                raise OperationError("invite_already_redeemed", 409)
             if status == "issued":
                 await db.invites.update({"id": id}, {"revoked_at": self._timestamp()})
                 status = "revoked"

@@ -93,6 +93,33 @@ request bodies, credentials, or raw network errors. Async cancellation and
 synchronous `KeyboardInterrupt` propagate after cleanup. JSON retains strings,
 including timestamps, without automatic date conversion.
 
+## Server operation errors
+
+Raise `chickinfry.server.OperationError(code, status, message=None, fields=())`
+for an intentional public business failure. The server accepts every integer HTTP
+status from 400 through 599, including 422 and custom codes at 501. Invalid codes,
+booleans, non-integer statuses and out-of-range statuses return
+`{"error":"operation_failed"}` with HTTP 500 and no details.
+
+```python
+from chickinfry.server import FieldError, OperationError
+
+raise OperationError(
+    "invalid_input", 422, "Quantity must be 10 or less.",
+    (FieldError("quantity", "too_large"),),
+)
+```
+
+The optional message must be valid Unicode, at most 1024 UTF-8 bytes, and contain
+no control characters. Fields are sent only for `invalid_input`, with at most 32
+valid path/code entries. Generated operations supply declared input paths through
+`Operation.input_fields`. Hand-written operations default to no declared paths,
+so field details are omitted unless that metadata is supplied. Invalid optional
+details are discarded independently; valid code and status are preserved.
+`str(error)` never includes the public message. Server errors and received SDK
+errors have distinct type identities; received SDK errors are never trusted as
+public server errors. The former server error name has no compatibility alias.
+
 ## Contributing
 
 Install development tools with `python -m pip install -r requirements-dev.txt`

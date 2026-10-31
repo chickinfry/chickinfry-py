@@ -9,7 +9,7 @@ import pytest
 
 from chickinfry import auth
 from chickinfry.auth import normalize_email
-from chickinfry.server import ServerError
+from chickinfry.server import OperationError
 
 # Email normalization corpus pinned by the checksum below; every entry
 # must normalize exactly as the shared cross-runtime contract expects.
@@ -27,7 +27,7 @@ def test_email_normalization_corpus(name: str) -> None:
     case = _EMAIL_CASES[name]
     try:
         normalized = normalize_email(case["input"])
-    except ServerError as error:
+    except OperationError as error:
         if case.get("error") != error.code or error.status != 400:
             pytest.fail(name, pytrace=False)
     else:
@@ -77,7 +77,7 @@ def test_email_length_rejects_before_format_check(
     monkeypatch.setattr(auth, "_valid_email_format", check_format)
     # Moving the format check before the length guard must fail without running a regex.
     value = "a@" + "." * 100_000 + " a"
-    with pytest.raises(ServerError) as caught:
+    with pytest.raises(OperationError) as caught:
         normalize_email(value)
     assert caught.value.code == "invalid_input"
     assert caught.value.status == 400

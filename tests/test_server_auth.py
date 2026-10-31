@@ -37,7 +37,7 @@ from chickinfry.orm import (
     parse_timestamp,
 )
 from chickinfry.postgres import CommitOutcomeUnknown, PostgresPort
-from chickinfry.server import ServerError, Session
+from chickinfry.server import OperationError, Session
 
 from .server_fixture import Harness, records
 
@@ -128,13 +128,13 @@ async def test_tokens_expiry_and_logout(db: Harness) -> None:
     observed = await private.sessions.find_by_id({"id": initial.session_id})
     assert observed is not None and observed.last_renewed_at == session.last_renewed_at
     db.instant += timedelta(seconds=1)
-    with pytest.raises(ServerError) as expired:
+    with pytest.raises(OperationError) as expired:
         await core.session(initial.access_token)
     assert expired.value.code == "invalid_token"
     rotated = await core.refresh(initial.refresh_token)
     assert parse_timestamp(rotated.refresh_expires_at) == db.now() + timedelta(days=30)
     await core.logout(rotated.access_token)
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.session(rotated.access_token)
     fresh = await core.signin("new@example.test", PASSWORD)
     first = db.now()
@@ -150,7 +150,7 @@ async def test_tokens_expiry_and_logout(db: Harness) -> None:
             days=days + 30
         )
     db.instant += timedelta(days=30)
-    with pytest.raises(ServerError) as family_expired:
+    with pytest.raises(OperationError) as family_expired:
         await core.refresh(fresh.refresh_token)
     assert family_expired.value.code == "session_revoked"
     revoked = await private.sessions.find_by_id({"id": fresh.session_id})
@@ -182,13 +182,13 @@ async def test_missing_corrupt_and_mismatch_have_one_same_kdf(
     tokens = await core.signup("present@example.test", PASSWORD)
     calls.clear()
     for email in ("present@example.test", "absent@example.test"):
-        with pytest.raises(ServerError) as failed:
+        with pytest.raises(OperationError) as failed:
             await core.signin(email, "a wrong long password")
         assert failed.value.code == "invalid_credentials"
     await PrivateDatabase(db.port()).users.update(
         {"id": tokens.user_id}, {"password_hash": "corrupt"}
     )
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.signin("present@example.test", PASSWORD)
     assert calls == [(32768, 8, 3, 16, 32, 64 << 20)] * 3
 
@@ -210,7 +210,7 @@ def test_password_policy(password: str, accepted: bool) -> None:
     if accepted:
         validate_password(password)
     else:
-        with pytest.raises(ServerError) as error:
+        with pytest.raises(OperationError) as error:
             validate_password(password)
         assert error.value.code == "invalid_input"
 
@@ -251,7 +251,7 @@ async def test_refresh_concurrency_commits_revocation(db: Harness) -> None:
         10,
     )
     assert sum(not isinstance(result, BaseException) for result in results) == 1
-    failures = [result for result in results if isinstance(result, ServerError)]
+    failures = [result for result in results if isinstance(result, OperationError)]
     assert len(failures) == 1 and failures[0].code == "session_revoked"
     private = PrivateDatabase(db.port())
     session = await private.sessions.find_by_id({"id": initial.session_id})
@@ -263,9 +263,9 @@ async def test_refresh_concurrency_commits_revocation(db: Harness) -> None:
     assert session.last_renewed_at == format_timestamp(db.now())
     winner = next(result for result in results if isinstance(result, Tokens))
     for tokens in (initial, winner):
-        with pytest.raises(ServerError):
+        with pytest.raises(OperationError):
             await auth(db).session(tokens.access_token)
-        with pytest.raises(ServerError):
+        with pytest.raises(OperationError):
             await auth(db).refresh(tokens.refresh_token)
     unchanged = await private.sessions.find_by_id({"id": session.id}) == session
     assert unchanged
@@ -283,9 +283,9 @@ async def test_user_revocation_checked_on_every_access_and_refresh(
     before = await private.sessions.find_by_id({"id": tokens.session_id})
     previous = await private.refresh_tokens.find_many()
     await private.users.update({"id": tokens.user_id}, patch)
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.session(tokens.access_token)
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.refresh(tokens.refresh_token)
     row = await private.sessions.find_by_id({"id": tokens.session_id})
     assert row is not None and row.revoked_at is not None
@@ -304,10 +304,10 @@ async def test_native_rejects_browser_session(db: Harness) -> None:
     await PrivateDatabase(db.port()).sessions.update(
         {"id": tokens.session_id}, {"transport": "browser"}
     )
-    with pytest.raises(ServerError) as invalid:
+    with pytest.raises(OperationError) as invalid:
         await core.session(tokens.access_token)
     assert invalid.value.code == "invalid_token"
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.refresh(tokens.refresh_token)
 
 
@@ -341,7 +341,7 @@ async def test_creating_hook_rolls_back_business_user_session_and_invite(
         signup="invite-only",
         hooks=AuthHooks(user_creating=creating, user_created=created),
     )
-    with pytest.raises(ServerError) as failed:
+    with pytest.raises(OperationError) as failed:
         await core.signup("invited@example.test", PASSWORD, code)
     assert failed.value.code == "user_creation_failed"
     assert await records(db.port()).find_many() == [] and committed == []
@@ -375,11 +375,11 @@ async def test_created_hook_observes_commit_failure_retains_account(
     core = Auth(
         db.port(), create_database, now=db.now, hooks=AuthHooks(creating, created)
     )
-    with pytest.raises(ServerError) as failed:
+    with pytest.raises(OperationError) as failed:
         await core.signup("retained@example.test", PASSWORD)
     assert failed.value.code == "user_created_effect_failed" and calls == 1
     await core.signin("retained@example.test", PASSWORD)
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.signup("retained@example.test", PASSWORD)
     assert calls == 1
 
@@ -430,7 +430,7 @@ async def test_invite_management_replay_metadata_and_signup_race(db: Harness) ->
     id = str(uuid4())
     issued = await core.invite_issue(owner.access_token, id, "Invited@Example.test")
     assert issued["email"] == "invited@example.test" and issued["status"] == "issued"
-    with pytest.raises(ServerError) as replay:
+    with pytest.raises(OperationError) as replay:
         await core.invite_issue(owner.access_token, id, "invited@example.test")
     assert replay.value.code == "invite_issue_replayed"
     page = await core.invite_list(owner.access_token, "")
@@ -441,7 +441,7 @@ async def test_invite_management_replay_metadata_and_signup_race(db: Harness) ->
         ("invited@example.test", ""),
         ("invited@example.test", "A" * 42 + "B"),
     ):
-        with pytest.raises(ServerError):
+        with pytest.raises(OperationError):
             await core.signup(email, PASSWORD, code)
     gate = Rendezvous()
 
@@ -479,7 +479,7 @@ async def test_invite_management_replay_metadata_and_signup_race(db: Harness) ->
         and invite.redeemed_by is not None
         and invite.redeemed_at is not None
     )
-    with pytest.raises(ServerError) as redeemed:
+    with pytest.raises(OperationError) as redeemed:
         await core.invite_revoke(owner.access_token, id)
     assert redeemed.value.code == "invite_already_redeemed"
     other_id = str(uuid4())
@@ -487,7 +487,7 @@ async def test_invite_management_replay_metadata_and_signup_race(db: Harness) ->
     assert (await core.invite_revoke(owner.access_token, other_id))[
         "status"
     ] == "revoked"
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.signup("other@example.test", PASSWORD, other["code"])
     assert len(await private.users.find_many()) == 2
 
@@ -571,7 +571,7 @@ async def test_invite_expiry_rechecked_after_real_lock(
                 pass
         db.instant = expiry
         release.set()
-        with pytest.raises(ServerError) as expired:
+        with pytest.raises(OperationError) as expired:
             await asyncio.wait_for(signup, 2)
         assert expired.value.code == "invite_invalid"
         await locker
@@ -640,7 +640,7 @@ async def test_invite_only_requires_invite_for_new_identity(
         redeemed = await private.invites.find_by_id({"id": invite.id})
         assert redeemed is not None and redeemed.redeemed_by == tokens.user_id
     else:
-        with pytest.raises(ServerError) as denied:
+        with pytest.raises(OperationError) as denied:
             await core.signin_identity(
                 "invited", "credential", "" if variant == "missing" else code
             )
@@ -658,7 +658,7 @@ async def test_invite_management_requires_hook_project_and_session(db: Harness) 
     """M16: reject absolute-expired families before management hooks or writes."""
     owner = await auth(db).signup("owner@example.test", PASSWORD)
     core = Auth(db.port(), create_database, now=db.now, signup="invite-only")
-    with pytest.raises(ServerError) as denied:
+    with pytest.raises(OperationError) as denied:
         await core.invite_list(owner.access_token, "")
     assert denied.value.code == "permission_denied"
 
@@ -675,17 +675,17 @@ async def test_invite_management_requires_hook_project_and_session(db: Harness) 
         signup="invite-only",
         hooks=AuthHooks(invite_managing=allowed),
     )
-    with pytest.raises(ServerError) as unbound:
+    with pytest.raises(OperationError) as unbound:
         await core.invite_list(owner.access_token, "")
     assert unbound.value.code == "service_unavailable"
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.invite_list(random_token(), "")
     core.project_id = str(uuid4())
     core.absolute_lifetime_seconds = 3600
     db.instant += timedelta(seconds=3599)
     rotated = await core.refresh(owner.refresh_token)
     db.instant += timedelta(seconds=1)
-    with pytest.raises(ServerError) as expired:
+    with pytest.raises(OperationError) as expired:
         await core.invite_issue(rotated.access_token, str(uuid4()), "new@example.test")
     assert expired.value.code == "invalid_token"
     assert calls == 0 and await PrivateDatabase(db.port()).invites.find_many() == []
@@ -730,7 +730,7 @@ async def test_custom_identity_does_not_link_by_email_and_charges_failures(
         await core.signin_identity("external", "subject-one")
     ).user_id == first.user_id
     assert len(calls) == 1
-    with pytest.raises(ServerError) as conflict:
+    with pytest.raises(OperationError) as conflict:
         await core.signin_identity("external", "subject-two")
     assert conflict.value.code == "identity_conflict"
     private = PrivateDatabase(db.port())
@@ -747,10 +747,10 @@ async def test_custom_identity_does_not_link_by_email_and_charges_failures(
         id = "budget"
 
     budget = Auth(db.port(), create_database, now=db.now, providers=[BudgetProvider()])
-    with pytest.raises(ServerError) as invalid:
+    with pytest.raises(OperationError) as invalid:
         await budget.signin_identity("budget", "bad")
     assert invalid.value.code == "invalid_credentials"
-    with pytest.raises(ServerError) as limited:
+    with pytest.raises(OperationError) as limited:
         await budget.signin_identity("budget", "different")
     assert limited.value.code == "rate_limited"
     assert len(await private.users.find_many()) == 1
@@ -934,12 +934,12 @@ async def test_family_expiry_boundary(db: Harness, offset: int, absolute: int) -
         assert await core.session(rotated.access_token)
         if absolute:
             db.instant += timedelta(seconds=1)
-            with pytest.raises(ServerError):
+            with pytest.raises(OperationError):
                 await core.session(rotated.access_token)
-            with pytest.raises(ServerError):
+            with pytest.raises(OperationError):
                 await core.refresh(rotated.refresh_token)
     else:
-        with pytest.raises(ServerError) as expired:
+        with pytest.raises(OperationError) as expired:
             await core.refresh(initial.refresh_token)
         assert expired.value.code == "session_revoked"
         after = await private.sessions.find_by_id({"id": initial.session_id})
@@ -1032,10 +1032,10 @@ async def test_legacy_conversion_preserves_stored_expiry(
             {"id": tokens.session_id},
             {"expires_at": format_timestamp(db.now() + timedelta(seconds=900))},
         )
-        with pytest.raises(ServerError) as access_expired:
+        with pytest.raises(OperationError) as access_expired:
             await core.session(tokens.access_token)
         assert access_expired.value.code == "invalid_token"
-        with pytest.raises(ServerError):
+        with pytest.raises(OperationError):
             await core.refresh(tokens.refresh_token)
         row = await private.sessions.find_by_id({"id": tokens.session_id})
         assert (
@@ -1072,9 +1072,9 @@ async def test_legacy_idle_uses_latest_successful_issue(
         {"id": tokens.session_id},
         {"expires_at": format_timestamp(db.now() + timedelta(seconds=900))},
     )
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.refresh("malformed")
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.refresh(random_token())
     if offset < 0:
         assert (await core.session(tokens.access_token)).id == tokens.session_id
@@ -1083,7 +1083,7 @@ async def test_legacy_idle_uses_latest_successful_issue(
             seconds=3600
         )
         renewed = await private.sessions.find_by_id({"id": tokens.session_id})
-        with pytest.raises(ServerError):
+        with pytest.raises(OperationError):
             await core.refresh(old)
         revoked = await private.sessions.find_by_id({"id": tokens.session_id})
         assert (
@@ -1092,10 +1092,10 @@ async def test_legacy_idle_uses_latest_successful_issue(
             and revoked.last_renewed_at == renewed.last_renewed_at
         )
     else:
-        with pytest.raises(ServerError) as access_expired:
+        with pytest.raises(OperationError) as access_expired:
             await core.session(tokens.access_token)
         assert access_expired.value.code == "invalid_token"
-        with pytest.raises(ServerError):
+        with pytest.raises(OperationError):
             await core.refresh(tokens.refresh_token)
         revoked = await private.sessions.find_by_id({"id": tokens.session_id})
         assert revoked is not None and revoked.last_renewed_at is None
@@ -1124,7 +1124,7 @@ async def test_refresh_failure_is_atomic(db: Harness, mode: str) -> None:
         with pytest.raises(CommitOutcomeUnknown):
             await auth(db, port).refresh(tokens.refresh_token)
         assert len(await private.refresh_tokens.find_many()) == 2
-        with pytest.raises(ServerError):
+        with pytest.raises(OperationError):
             await core.refresh(tokens.refresh_token)
         return
     setup = db.port()
@@ -1139,7 +1139,7 @@ async def test_refresh_failure_is_atomic(db: Harness, mode: str) -> None:
     await setup._execute(
         f"create trigger fail_refresh_write before {action} on app_auth_refresh_tokens for each row execute function fail_refresh_write()"
     )
-    with pytest.raises(ServerError if mode == "consume_zero" else Exception):
+    with pytest.raises(OperationError if mode == "consume_zero" else Exception):
         await core.refresh(tokens.refresh_token)
     after = await private.sessions.find_by_id({"id": tokens.session_id})
     assert before is not None and after is not None
@@ -1247,7 +1247,7 @@ async def test_refresh_expiry_rechecked_after_real_lock(
                 pass
         db.instant = expiry
         release.set()
-        with pytest.raises(ServerError) as expired:
+        with pytest.raises(OperationError) as expired:
             await asyncio.wait_for(rotation, 2)
         assert expired.value.code == "session_revoked"
         await locker
@@ -1314,13 +1314,13 @@ async def test_current_policy_keeps_original_bases_and_never_revives(
     db.instant = parse_timestamp(rotated.refresh_expires_at)
     core.idle_timeout_seconds = 31536000
     core.absolute_lifetime_seconds = 0
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.refresh(rotated.refresh_token)
     row = await PrivateDatabase(db.port()).sessions.find_by_id(
         {"id": tokens.session_id}
     )
     assert row is not None and row.first_login_at == format_timestamp(started)
-    with pytest.raises(ServerError):
+    with pytest.raises(OperationError):
         await core.refresh(rotated.refresh_token)
 
 
@@ -1385,9 +1385,9 @@ async def test_reuse_and_latest_rotation_commit_orders(
         )
         for result in results:
             if isinstance(result, Tokens):
-                with pytest.raises(ServerError):
+                with pytest.raises(OperationError):
                     await core.session(result.access_token)
-                with pytest.raises(ServerError):
+                with pytest.raises(OperationError):
                     await core.refresh(result.refresh_token)
     finally:
         release.set()
