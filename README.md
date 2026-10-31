@@ -15,9 +15,9 @@ python -m pip install .
 Use the synchronous transport in scripts and other blocking applications:
 
 ```python
-from chickinfry import HTTP, ClientError, OperationError
+from chickinfry import HttpTransport, ClientError, OperationError
 
-with HTTP("https://api.example.com") as transport:
+with HttpTransport("https://api.example.com") as transport:
     try:
         result = transport.invoke("account.get_status", {})
         print(result)
@@ -31,26 +31,26 @@ Use the async transport with asyncio:
 
 ```python
 import asyncio
-from chickinfry import AsyncHTTP
+from chickinfry import AsyncHttpTransport
 
 async def main():
-    async with AsyncHTTP("https://api.example.com") as transport:
+    async with AsyncHttpTransport("https://api.example.com") as transport:
         result = await transport.invoke("account.get_status", {})
         print(result)
 
 asyncio.run(main())
 ```
 
-`HTTP` can be shared by threads. `AsyncHTTP` stays on one asyncio event loop.
-Generated synchronous clients consume `SyncClientTransport`; generated async
-clients consume `ClientTransport`. Both return the same JSON values and use the
+`HttpTransport` can be shared by threads. `AsyncHttpTransport` stays on one asyncio event loop.
+Generated synchronous clients consume `Transport`; generated async
+clients consume `AsyncTransport`. Both return the same JSON values and use the
 same errors and string-preserving readers in `chickinfry.wire`.
 
 Use `transport.with_bearer(token)` for a separate authenticated transport, or
-`transport.with_session(store)` with a `SessionStore(origin, credentials)`.
+`transport.with_session(store)` with a `MemoryStore(origin, credentials)`.
 Neither changes the anonymous transport or its other copies. The original
-transport owns the pool: `HTTP` closes it with `close()` or `with`, and
-`AsyncHTTP` with `aclose()` or `async with`. Copies cannot close the pool.
+transport owns the pool: `HttpTransport` closes it with `close()` or `with`, and
+`AsyncHttpTransport` with `aclose()` or `async with`. Copies cannot close the pool.
 
 `SessionCredentials` contains `access_token`, `refresh_token`, `expires_at`,
 `refresh_expires_at`, `user_id`, and `session_id`. Tokens are hidden from its
@@ -58,7 +58,7 @@ representation. `store.credentials()` returns the current snapshot or `None`;
 `replace(credentials)` installs a login and `clear(expected)` clears only that
 exact snapshot. The first successful `with_session` permanently binds a store
 to synchronous threads or one asyncio loop. Mixing both transports on that
-store raises `ClientError("invalid_session")`, including after logout or close.
+store raises `ClientError("failed_precondition")`, including after logout or close.
 Use separate stores for the two modes. Do not concurrently copy the same
 rotating credentials into separate stores.
 
@@ -70,7 +70,7 @@ A refresh failure other than a well-formed 401 preserves credentials and
 blocks further automatic refresh for that snapshot until `replace()` installs
 new credentials. A well-formed 401 clears only the expected snapshot and does
 not resend the original request. Invalid non-success error envelopes report
-`invalid_response` with the received HTTP status.
+`ClientError("internal")` with the received HTTP status.
 
 Origins must be HTTPS or explicit IP loopback HTTP. Redirects, cookies,
 environment proxies, and invalid tokens are rejected. Requests are limited to
@@ -85,6 +85,21 @@ connection or request is started. The actual return time then depends on the
 OS resolver; the 30-second attempt and 90-second call limits are not guaranteed
 while DNS is blocked. A refresh producer remains tracked until it exits.
 
+Generated clients use `create_client(transport)` and
+`create_async_client(transport)` from the generated package, returning `Client`
+and `AsyncClient` respectively. Both factories accept one transport argument.
+The synchronous names are `Transport` and `HttpTransport`; async equivalents are
+`AsyncTransport` and `AsyncHttpTransport`. No previous names are aliased.
+
+Local `ClientError.code` values are `invalid_argument`, `failed_precondition`,
+`resource_exhausted`, `deadline_exceeded`, `canceled`, `unavailable`, `data_loss`,
+`unimplemented`, `internal`, `unknown`, and `unauthenticated`. Missing local
+sessions use `unauthenticated`. Device storage access, capacity, corruption, and
+unsupported versions use `failed_precondition`, `resource_exhausted`, `data_loss`,
+and `unimplemented` respectively. Redirects and malformed responses use
+`internal`. Local failures retain a received HTTP status or `None`; timeouts
+and cancellation never invent one.
+
 `OperationError` is a `ClientError` with the server's `code` and HTTP `status`.
 Validated server descriptions are available as `response_message` (`None` when
 absent or invalid; empty strings are preserved). For `invalid_input`, `fields`
@@ -93,8 +108,10 @@ details are discarded independently while code and HTTP status are preserved.
 Session refresh failure snapshots preserve both details and the existing request
 outcome uncertainty; they do not add automatic business retries.
 Printing either error gives an English sentence with a next action; use the
-`reason`, `code`, and `status` attributes for programmatic error handling.
-Local failures expose a safe `reason` and an optional received `status`, without
+`code` and `status` attributes for programmatic error handling.
+Per-cause diagnostics retain their fixed, actionable wording; use common codes
+for programmatic decisions. Local failures expose a common `code` and an optional
+received `status`, without
 request bodies, credentials, or raw network errors. Async cancellation and
 synchronous `KeyboardInterrupt` propagate after cleanup. JSON retains strings,
 including timestamps, without automatic date conversion.
@@ -199,14 +216,14 @@ this native-only runtime; the browser cookie/bearer mixing rule does not apply.
 The runtime includes a private bridge for generated clients to supply trusted
 app, canonical API origin, project/environment, user and signup-screen context.
 Generated default wiring is integrated separately. Existing explicit
-`SessionStore` injection remains in memory and retains its loop/mode contract.
+`MemoryStore` injection remains in memory and retains its loop/mode contract.
 
-`HTTP` and `AsyncHTTP` accept `persist` alongside `timeout` and pass it to the
+`HttpTransport` and `AsyncHttpTransport` accept `persist` alongside `timeout` and pass it to the
 private context-bound bridge. Explicit `with_session` injection remains caller-owned.
 The bridge accepts `persist=False` for explicit memory-only operation and
 `persist={"dir": path}` for a state directory. Relative directories are resolved once against the
 working directory when the transport is constructed; a later chdir does not
-move the store. An empty string raises `device_storage_unavailable`. Defaults
+move the store. An empty string raises `failed_precondition`. Defaults
 never fall back to the working directory. Omission selects Linux
 `XDG_STATE_HOME` (or `HOME/.local/state`), macOS `HOME/Library/Application Support`,
 or Windows `LOCALAPPDATA`. No SQLite, keychain or encryption dependency is used.
@@ -241,9 +258,9 @@ the login succeeds and the new session stays in memory for this run; persistence
 is not promised. Location-creation failures remain configuration errors.
 Restore, pre-refresh and deletion failures are not converted to memory success.
 Corruption and unknown/newer versions preserve the original and block access.
-The existing `ClientError` channel retains `device_storage_unavailable`,
-`device_storage_corrupt`, `device_storage_full`, and
-`device_storage_version_unsupported`, with no fabricated HTTP status.
+The existing `ClientError` channel retains `failed_precondition`,
+`data_loss`, `resource_exhausted`, and
+`unimplemented`, with no fabricated HTTP status.
 
 Core/auth must connect generated defaults, explicit `auth.refresh` pre-send
 claims and conditional transitions. No cache, offline queue or automatic reset

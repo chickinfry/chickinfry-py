@@ -5,7 +5,7 @@ import json
 from importlib.resources import files
 
 import chickinfry
-from chickinfry import HTTP, AsyncHTTP, ClientTransport, SyncClientTransport
+from chickinfry import AsyncHttpTransport, AsyncTransport, HttpTransport, Transport
 
 
 async def main() -> None:
@@ -43,13 +43,13 @@ async def main() -> None:
         origin = f"http://127.0.0.1:{port}"
 
         def sync_call() -> object:
-            with HTTP(origin) as transport:
-                client: SyncClientTransport = transport
+            with HttpTransport(origin) as transport:
+                client: Transport = transport
                 return client.invoke("account.get_status", {})
 
         synchronous = await asyncio.to_thread(sync_call)
-        async with AsyncHTTP(origin) as transport:
-            client: ClientTransport = transport
+        async with AsyncHttpTransport(origin) as transport:
+            client: AsyncTransport = transport
             asynchronous = await client.invoke("account.get_status", {})
         assert synchronous == asynchronous == {"status": "active"}
         assert received == [b"{}", b"{}"]

@@ -14,12 +14,12 @@ from urllib.parse import SplitResult
 import pytest
 
 from chickinfry import (
-    HTTP,
-    AsyncHTTP,
+    AsyncHttpTransport,
     ClientError,
+    HttpTransport,
+    MemoryStore,
     OperationError,
     SessionCredentials,
-    SessionStore,
 )
 from chickinfry.wire import read_list, read_record, read_string
 
@@ -63,10 +63,12 @@ from .peer import Peer, Received, json_bytes, respond
         "ftp://127.0.0.1",
     ],
 )
-@pytest.mark.parametrize("transport", [HTTP, AsyncHTTP])
-def test_origin_rejected(origin: str, transport: type[HTTP] | type[AsyncHTTP]) -> None:
+@pytest.mark.parametrize("transport", [HttpTransport, AsyncHttpTransport])
+def test_origin_rejected(
+    origin: str, transport: type[HttpTransport] | type[AsyncHttpTransport]
+) -> None:
     with pytest.raises(
-        ClientError, check=lambda error: error.reason == "invalid_origin"
+        ClientError, check=lambda error: error.code == "invalid_argument"
     ):
         transport(origin)
 
@@ -82,16 +84,18 @@ def test_origin_rejected(origin: str, transport: type[HTTP] | type[AsyncHTTP]) -
         "https://[::ffff:127.0.0.1]",
     ],
 )
-@pytest.mark.parametrize("transport", [HTTP, AsyncHTTP])
-def test_origin_accepted(origin: str, transport: type[HTTP] | type[AsyncHTTP]) -> None:
+@pytest.mark.parametrize("transport", [HttpTransport, AsyncHttpTransport])
+def test_origin_accepted(
+    origin: str, transport: type[HttpTransport] | type[AsyncHttpTransport]
+) -> None:
     transport(origin)
 
 
 @pytest.mark.parametrize("authority", ["[::1]suffix", "prefix[::1]"])
-@pytest.mark.parametrize("transport", [HTTP, AsyncHTTP])
+@pytest.mark.parametrize("transport", [HttpTransport, AsyncHttpTransport])
 def test_origin_rejects_bracket_suffix_and_prefix_with_legacy_parser(
     authority: str,
-    transport: type[HTTP] | type[AsyncHTTP],
+    transport: type[HttpTransport] | type[AsyncHttpTransport],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from chickinfry import _origin
@@ -100,7 +104,7 @@ def test_origin_rejects_bracket_suffix_and_prefix_with_legacy_parser(
     parsed = SplitResult("http", authority, "", "", "")
     monkeypatch.setattr(_origin, "urlsplit", lambda origin: parsed)
     with pytest.raises(
-        ClientError, check=lambda error: error.reason == "invalid_origin"
+        ClientError, check=lambda error: error.code == "invalid_argument"
     ):
         transport("http://" + authority)
 
@@ -108,9 +112,9 @@ def test_origin_rejects_bracket_suffix_and_prefix_with_legacy_parser(
 @pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), float("nan"), True])
 def test_timeout_validation(timeout: float) -> None:
     with pytest.raises(
-        ClientError, check=lambda error: error.reason == "invalid_timeout"
+        ClientError, check=lambda error: error.code == "invalid_argument"
     ):
-        AsyncHTTP("https://example.com", timeout=timeout)
+        AsyncHttpTransport("https://example.com", timeout=timeout)
 
 
 async def test_copy_isolation_cookies_proxy_and_origin_binding(
@@ -124,7 +128,7 @@ async def test_copy_isolation_cookies_proxy_and_origin_binding(
     monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:1")
     monkeypatch.setenv("NO_PROXY", "")
     tokens = [secrets.token_urlsafe(32) for _ in range(4)]
-    async with Peer(handler) as peer, AsyncHTTP(peer.origin) as owner:
+    async with Peer(handler) as peer, AsyncHttpTransport(peer.origin) as owner:
         credentials = SessionCredentials(
             access_token=tokens[2],
             refresh_token=tokens[3],
@@ -133,7 +137,7 @@ async def test_copy_isolation_cookies_proxy_and_origin_binding(
             user_id="u",
             session_id="s",
         )
-        store = SessionStore(peer.origin + "/", credentials)
+        store = MemoryStore(peer.origin + "/", credentials)
         copies = [
             owner.with_bearer(tokens[0]),
             owner.with_bearer(tokens[1]),
@@ -157,16 +161,16 @@ async def test_copy_isolation_cookies_proxy_and_origin_binding(
         for item, token in zip(peer.received[1:4], tokens[:3], strict=True):
             assert bool(item.headers["authorization"] == "Bearer " + token)
         with pytest.raises(
-            ClientError, check=lambda error: error.reason == "origin_mismatch"
+            ClientError, check=lambda error: error.code == "failed_precondition"
         ):
-            owner.with_session(SessionStore("https://example.com", credentials))
+            owner.with_session(MemoryStore("https://example.com", credentials))
         for token in ["", tokens[0] + "\n", "bad"]:
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "invalid_token"
+                ClientError, check=lambda error: error.code == "invalid_argument"
             ):
                 owner.with_bearer(token)
     with pytest.raises(
-        ClientError, check=lambda error: error.reason == "transport_closed"
+        ClientError, check=lambda error: error.code == "failed_precondition"
     ):
         await copies[0].invoke("thing.run", {})
 
@@ -175,10 +179,10 @@ async def test_input_rejected_before_send_and_values_preserved() -> None:
     async def echo(request: Received, writer: asyncio.StreamWriter) -> None:
         await respond(writer, request.body)
 
-    async with Peer(echo) as peer, AsyncHTTP(peer.origin) as transport:
+    async with Peer(echo) as peer, AsyncHttpTransport(peer.origin) as transport:
         for operation in ["thing.run\n", "Thing.run", "thing/run", "thing..run"]:
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "invalid_operation"
+                ClientError, check=lambda error: error.code == "invalid_argument"
             ):
                 await transport.invoke(operation, {})
         bad: list[bytes | Mapping[str, object]] = [
@@ -193,7 +197,7 @@ async def test_input_rejected_before_send_and_values_preserved() -> None:
         ]
         for payload in bad:
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "invalid_input"
+                ClientError, check=lambda error: error.code == "invalid_argument"
             ):
                 await transport.invoke("thing.run", payload)
         assert len(peer.received) == 0
@@ -208,25 +212,19 @@ async def test_input_rejected_before_send_and_values_preserved() -> None:
 
 @pytest.mark.parametrize("value", [None, 1, True, [], "string"])
 def test_record_reader_rejects_invalid(value: object) -> None:
-    with pytest.raises(
-        ClientError, check=lambda error: error.reason == "invalid_response"
-    ):
+    with pytest.raises(ClientError, check=lambda error: error.code == "internal"):
         read_record(value)
 
 
 @pytest.mark.parametrize("value", [None, 1, True, {}, "string"])
 def test_list_reader_rejects_invalid(value: object) -> None:
-    with pytest.raises(
-        ClientError, check=lambda error: error.reason == "invalid_response"
-    ):
+    with pytest.raises(ClientError, check=lambda error: error.code == "internal"):
         read_list(value)
 
 
 @pytest.mark.parametrize("value", [None, 1, True, {}, []])
 def test_string_reader_rejects_invalid(value: object) -> None:
-    with pytest.raises(
-        ClientError, check=lambda error: error.reason == "invalid_response"
-    ):
+    with pytest.raises(ClientError, check=lambda error: error.code == "internal"):
         read_string(value)
 
 
@@ -235,13 +233,13 @@ def test_string_reader_rejects_invalid(value: object) -> None:
     [
         (429, b'{"error":"rate_limited"}', "rate_limited"),
         (500, b'{"error":"operation_failed","detail":"hidden"}', "operation_failed"),
-        (503, b"not json", "invalid_response"),
-        (401, b'{"error":"invalid_token\\n"}', "invalid_response"),
-        (400, b'{"error":1}', "invalid_response"),
-        (400, b"[]", "invalid_response"),
-        (302, b"ignored", "redirect_not_allowed"),
-        (307, b"ignored", "redirect_not_allowed"),
-        (308, b"ignored", "redirect_not_allowed"),
+        (503, b"not json", "internal"),
+        (401, b'{"error":"invalid_token\\n"}', "internal"),
+        (400, b'{"error":1}', "internal"),
+        (400, b"[]", "internal"),
+        (302, b"ignored", "internal"),
+        (307, b"ignored", "internal"),
+        (308, b"ignored", "internal"),
     ],
 )
 async def test_errors_status_no_redirect_or_resend(
@@ -255,10 +253,11 @@ async def test_errors_status_no_redirect_or_resend(
             headers={"Location": peer.origin + "/thing.run"},
         )
 
-    async with Peer(handler) as peer, AsyncHTTP(peer.origin) as transport:
-        with pytest.raises(OperationError) as caught:
+    async with Peer(handler) as peer, AsyncHttpTransport(peer.origin) as transport:
+        with pytest.raises(ClientError) as caught:
             await transport.invoke("thing.run", {})
         assert caught.value.code == code
+        assert isinstance(caught.value, OperationError) == (code != "internal")
         assert caught.value.status == status
         assert len(peer.received) == 1
         assert "hidden" not in repr(caught.value)
@@ -271,11 +270,11 @@ async def test_invalid_success_json_is_local_error(body: bytes) -> None:
     async def handler(request: Received, writer: asyncio.StreamWriter) -> None:
         await respond(writer, body)
 
-    async with Peer(handler) as peer, AsyncHTTP(peer.origin) as transport:
+    async with Peer(handler) as peer, AsyncHttpTransport(peer.origin) as transport:
         with pytest.raises(ClientError) as caught:
             await transport.invoke("thing.run", {})
         assert type(caught.value) is ClientError
-        assert caught.value.reason == "invalid_response"
+        assert caught.value.code == "internal"
         assert caught.value.status == 200
         assert len(peer.received) == 1
 
@@ -287,11 +286,11 @@ async def test_disconnect_and_raw_exception_redaction() -> None:
         writer.write(b"HTTP/1.1 " + token.encode() + b"\r\n\r\n")
         await writer.drain()
 
-    async with Peer(disconnect) as peer, AsyncHTTP(peer.origin) as owner:
+    async with Peer(disconnect) as peer, AsyncHttpTransport(peer.origin) as owner:
         with pytest.raises(ClientError) as caught:
             await owner.with_bearer(token).invoke("thing.run", {"private": token})
         failure = caught.value
-        assert failure.reason == "network_error"
+        assert failure.code == "unavailable"
         assert failure.__context__ is None and failure.__cause__ is None
         assert bool(
             token
@@ -308,15 +307,15 @@ async def test_request_utf8_boundary() -> None:
 
     limit = 4 * 1024 * 1024
     payload = {"text": "한" * ((limit - 11) // 3) + "a" * ((limit - 11) % 3)}
-    async with Peer(handler) as peer, AsyncHTTP(peer.origin) as transport:
+    async with Peer(handler) as peer, AsyncHttpTransport(peer.origin) as transport:
         await transport.invoke("thing.run", payload)
         assert len(peer.received[0].body) == limit
         with pytest.raises(
-            ClientError, check=lambda error: error.reason == "request_too_large"
+            ClientError, check=lambda error: error.code == "resource_exhausted"
         ):
             await transport.invoke("thing.run", {"text": str(payload["text"]) + "a"})
         with pytest.raises(
-            ClientError, check=lambda error: error.reason == "request_too_large"
+            ClientError, check=lambda error: error.code == "resource_exhausted"
         ):
             await transport.invoke("thing.run", b" " * (limit + 1))
         assert len(peer.received) == 1
@@ -355,10 +354,10 @@ async def test_streamed_response_boundary(
             chunked=True,
         )
 
-    async with Peer(handler) as peer, AsyncHTTP(peer.origin) as transport:
+    async with Peer(handler) as peer, AsyncHttpTransport(peer.origin) as transport:
         if extra:
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "response_too_large"
+                ClientError, check=lambda error: error.code == "resource_exhausted"
             ) as caught:
                 await transport.invoke("thing.run", {})
             assert caught.value.status == status
@@ -403,7 +402,10 @@ async def test_whole_body_deadline_cancel_disconnect_and_no_resend(
             sender.cancel()
             await asyncio.gather(sender, return_exceptions=True)
 
-    async with Peer(slow) as peer, AsyncHTTP(peer.origin, timeout=0.15) as transport:
+    async with (
+        Peer(slow) as peer,
+        AsyncHttpTransport(peer.origin, timeout=0.15) as transport,
+    ):
         begin = asyncio.get_running_loop().time()
         task = asyncio.create_task(transport.invoke("thing.run", {}))
         await asyncio.wait_for(started.wait(), 1)
@@ -413,7 +415,7 @@ async def test_whole_body_deadline_cancel_disconnect_and_no_resend(
                 await task
         else:
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "timeout"
+                ClientError, check=lambda error: error.code == "deadline_exceeded"
             ) as caught:
                 await task
             assert caught.value.status == 200
@@ -433,9 +435,9 @@ if sys.argv[1] == 'pyodide':
 else:
     sys.platform = sys.argv[1]
 try:
-    chickinfry.AsyncHTTP('http://127.0.0.1')
+    chickinfry.AsyncHttpTransport('http://127.0.0.1')
 except chickinfry.ClientError as failure:
-    assert failure.reason == 'unsupported_environment'
+    assert failure.code == 'unimplemented'
 else:
     raise AssertionError('environment accepted')
 assert 'httpx' not in sys.modules
@@ -447,8 +449,8 @@ assert 'httpx' not in sys.modules
 
 
 def test_cross_event_loop_rejected() -> None:
-    owner = AsyncHTTP("https://example.com")
-    store = SessionStore("https://example.com")
+    owner = AsyncHttpTransport("https://example.com")
+    store = MemoryStore("https://example.com")
 
     async def first() -> None:
         async with owner:
@@ -458,11 +460,11 @@ def test_cross_event_loop_rejected() -> None:
 
     async def second() -> None:
         with pytest.raises(
-            ClientError, check=lambda error: error.reason == "wrong_event_loop"
+            ClientError, check=lambda error: error.code == "failed_precondition"
         ):
             await owner.invoke("thing.run", {})
         with pytest.raises(
-            ClientError, check=lambda error: error.reason == "wrong_event_loop"
+            ClientError, check=lambda error: error.code == "failed_precondition"
         ):
             store.credentials()
 
@@ -480,9 +482,9 @@ async def test_oversized_stream_is_closed_before_remaining_body() -> None:
         await request.reader.read()
         disconnected.set()
 
-    async with Peer(oversized) as peer, AsyncHTTP(peer.origin) as transport:
+    async with Peer(oversized) as peer, AsyncHttpTransport(peer.origin) as transport:
         with pytest.raises(
-            ClientError, check=lambda error: error.reason == "response_too_large"
+            ClientError, check=lambda error: error.code == "resource_exhausted"
         ):
             await transport.invoke("thing.run", {})
         await asyncio.wait_for(disconnected.wait(), 1)
@@ -493,9 +495,9 @@ async def test_received_mutation_then_connection_drop_has_no_replay() -> None:
     async def drop(request: Received, writer: asyncio.StreamWriter) -> None:
         return
 
-    async with Peer(drop) as peer, AsyncHTTP(peer.origin) as transport:
+    async with Peer(drop) as peer, AsyncHttpTransport(peer.origin) as transport:
         with pytest.raises(
-            ClientError, check=lambda error: error.reason == "network_error"
+            ClientError, check=lambda error: error.code == "unavailable"
         ):
             await transport.invoke("thing.run", {})
         assert len(peer.received) == 1
@@ -530,11 +532,11 @@ async def test_untrusted_tls_certificate_is_rejected(tmp_path: Path) -> None:
         await respond(writer)
 
     async with Peer(handler, ssl_context=context) as peer:
-        async with AsyncHTTP(
+        async with AsyncHttpTransport(
             peer.origin.replace("http://", "https://", 1)
         ) as transport:
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "network_error"
+                ClientError, check=lambda error: error.code == "unavailable"
             ):
                 await transport.invoke("thing.run", {})
         assert len(peer.received) == 0

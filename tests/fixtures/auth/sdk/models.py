@@ -22,9 +22,9 @@ class ProbeEchoOutput:
 
 def _encodeProbeEchoInput(value: ProbeEchoInput) -> dict[_builtins.str, object]:
     if not isinstance(value, ProbeEchoInput):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     if not isinstance(value.wire_value, str):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     return {
         "wire_value": value.wire_value,
     }
@@ -50,9 +50,9 @@ class ProbeIdentifyOutput:
 
 def _encodeProbeIdentifyInput(value: ProbeIdentifyInput) -> dict[_builtins.str, object]:
     if not isinstance(value, ProbeIdentifyInput):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     if not isinstance(value.id, str):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     return {
         "id": value.id,
     }
@@ -93,7 +93,7 @@ class ProbeListOutput:
 
 def _encodeProbeListInput(value: ProbeListInput) -> dict[_builtins.str, object]:
     if not isinstance(value, ProbeListInput):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     return {}
 
 
@@ -104,47 +104,6 @@ def _decodeProbeListOutput(value: object) -> ProbeListOutput:
             _decodeProbeListOutputRowsItem(item)
             for item in _wire.read_list(record.get("rows"))
         ],
-    )
-
-
-@dataclass(frozen=True, slots=True, kw_only=True, repr=False)
-class AuthIdentityInput:
-    credential: _builtins.str
-    provider: _builtins.str
-
-
-@dataclass(frozen=True, slots=True, kw_only=True, repr=False)
-class AuthIdentityOutput:
-    access_token: _builtins.str
-    expires_at: _builtins.str
-    refresh_expires_at: _builtins.str
-    refresh_token: _builtins.str
-    session_id: _builtins.str
-    user_id: _builtins.str
-
-
-def _encodeAuthIdentityInput(value: AuthIdentityInput) -> dict[_builtins.str, object]:
-    if not isinstance(value, AuthIdentityInput):
-        raise ClientError("invalid_input")
-    if not isinstance(value.credential, str):
-        raise ClientError("invalid_input")
-    if not isinstance(value.provider, str):
-        raise ClientError("invalid_input")
-    return {
-        "credential": value.credential,
-        "provider": value.provider,
-    }
-
-
-def _decodeAuthIdentityOutput(value: object) -> AuthIdentityOutput:
-    record = _wire.read_record(value)
-    return AuthIdentityOutput(
-        access_token=_wire.read_string(record.get("access_token")),
-        expires_at=_wire.read_string(record.get("expires_at")),
-        refresh_expires_at=_wire.read_string(record.get("refresh_expires_at")),
-        refresh_token=_wire.read_string(record.get("refresh_token")),
-        session_id=_wire.read_string(record.get("session_id")),
-        user_id=_wire.read_string(record.get("user_id")),
     )
 
 
@@ -160,7 +119,7 @@ class AuthLogoutOutput:
 
 def _encodeAuthLogoutInput(value: AuthLogoutInput) -> dict[_builtins.str, object]:
     if not isinstance(value, AuthLogoutInput):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     return {}
 
 
@@ -188,9 +147,9 @@ class AuthRefreshOutput:
 
 def _encodeAuthRefreshInput(value: AuthRefreshInput) -> dict[_builtins.str, object]:
     if not isinstance(value, AuthRefreshInput):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     if not isinstance(value.refresh_token, str):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     return {
         "refresh_token": value.refresh_token,
     }
@@ -216,13 +175,14 @@ class AuthSessionInput:
 @dataclass(frozen=True, slots=True, kw_only=True, repr=False)
 class AuthSessionOutput:
     email: _builtins.str
+    expires_at: _builtins.str
     id: _builtins.str
     session_id: _builtins.str
 
 
 def _encodeAuthSessionInput(value: AuthSessionInput) -> dict[_builtins.str, object]:
     if not isinstance(value, AuthSessionInput):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     return {}
 
 
@@ -230,6 +190,7 @@ def _decodeAuthSessionOutput(value: object) -> AuthSessionOutput:
     record = _wire.read_record(value)
     return AuthSessionOutput(
         email=_wire.read_string(record.get("email")),
+        expires_at=_wire.read_string(record.get("expires_at")),
         id=_wire.read_string(record.get("id")),
         session_id=_wire.read_string(record.get("session_id")),
     )
@@ -253,11 +214,11 @@ class AuthSigninOutput:
 
 def _encodeAuthSigninInput(value: AuthSigninInput) -> dict[_builtins.str, object]:
     if not isinstance(value, AuthSigninInput):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     if not isinstance(value.email, str):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     if not isinstance(value.password, str):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     return {
         "email": value.email,
         "password": value.password,
@@ -294,11 +255,11 @@ class AuthSignupOutput:
 
 def _encodeAuthSignupInput(value: AuthSignupInput) -> dict[_builtins.str, object]:
     if not isinstance(value, AuthSignupInput):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     if not isinstance(value.email, str):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     if not isinstance(value.password, str):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     return {
         "email": value.email,
         "password": value.password,

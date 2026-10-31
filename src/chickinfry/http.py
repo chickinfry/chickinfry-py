@@ -19,7 +19,7 @@ from ._http_common import (
 from ._origin import canonical_origin
 from ._request_logs import _request_logs
 from ._request_state import _RequestState
-from .errors import ClientError, OperationError
+from .errors import ClientError, OperationError, _local_error
 from .session import (
     SessionCredentials,
     _Failure,
@@ -35,10 +35,10 @@ if TYPE_CHECKING:
 
 def _check_deadline(deadline: float) -> None:
     if asyncio.get_running_loop().time() >= deadline:
-        raise ClientError("timeout")
+        raise ClientError("deadline_exceeded")
 
 
-class ClientTransport(Protocol):
+class AsyncTransport(Protocol):
     """The shared async operation contract consumed by generated clients."""
 
     async def invoke(
@@ -48,7 +48,7 @@ class ClientTransport(Protocol):
         ...
 
 
-class AsyncHTTP:
+class AsyncHttpTransport:
     """An anonymous origin-bound transport owning the lifetime of its HTTP pool."""
 
     def __init__(
@@ -73,10 +73,10 @@ class AsyncHTTP:
         except RuntimeError:
             loop = None
         if loop is None or (self._loop is not None and self._loop is not loop):
-            raise ClientError("wrong_event_loop")
+            raise _local_error("failed_precondition", "wrong_event_loop")
         self._loop = loop
         if self._closed:
-            raise ClientError("transport_closed")
+            raise _local_error("failed_precondition", "transport_closed")
 
     def _http_client(self) -> "httpx.AsyncClient":
         self._check_loop()
@@ -122,14 +122,14 @@ class AsyncHTTP:
             persist=self._persist,
         )
 
-    def with_bearer(self, token: str) -> ClientTransport:
+    def with_bearer(self, token: str) -> AsyncTransport:
         if not _valid_token(token):
-            raise ClientError("invalid_token")
+            raise _local_error("invalid_argument", "invalid_token")
         return _Authenticated(self, token=token)
 
-    def with_session(self, store: _SessionStore) -> ClientTransport:
+    def with_session(self, store: _SessionStore) -> AsyncTransport:
         if not isinstance(store, _SessionStore):
-            raise ClientError("invalid_session")
+            raise ClientError("failed_precondition")
         store._attach("async", self._origin)
         return _Authenticated(self, store=store)
 
@@ -199,7 +199,7 @@ class AsyncHTTP:
             if store is not None:
                 store._release(generation)
         if timed_out:
-            raise ClientError("timeout")
+            raise ClientError("deadline_exceeded")
         raise AssertionError
 
     async def _refresh(
@@ -261,11 +261,11 @@ class AsyncHTTP:
         except ClientError as error:
             failure = _Failure.from_error(error)
         except _HookError:
-            failure = _Failure("network_error", retryable=True, hook_failed=True)
+            failure = _Failure("unavailable", retryable=True, hook_failed=True)
         with store._locked():
             if asyncio.get_running_loop().time() >= deadline:
                 failure = _Failure(
-                    "timeout",
+                    "deadline_exceeded",
                     failure.status if failure is not None else None,
                     outcome_unknown=failure.outcome_unknown
                     if failure is not None
@@ -334,7 +334,7 @@ class AsyncHTTP:
                                 observation.notify("redirect", response)
                             if not refresh:
                                 state.finish()
-                            raise OperationError("redirect_not_allowed", status)
+                            raise _local_error("internal", "operation_failed", status)
                         data = await _read_body(response)
                         if observation is not None:
                             observation.record_body(data)
@@ -346,7 +346,7 @@ class AsyncHTTP:
                             try:
                                 decoded = _read_credentials(value)
                             except ClientError:
-                                failure = ClientError("invalid_response", status)
+                                failure = ClientError("internal", status)
                             else:
                                 if credentials:
                                     value = decoded
@@ -357,11 +357,11 @@ class AsyncHTTP:
             except (TimeoutError, httpx.TimeoutException) as error:
                 if observation is not None:
                     observation.details.extend((type(error).__name__, str(error)))
-                failure = ClientError("timeout", status)
+                failure = ClientError("deadline_exceeded", status)
             except (httpx.HTTPError, OSError, RuntimeError) as error:
                 if observation is not None:
                     observation.details.extend((type(error).__name__, str(error)))
-                failure = ClientError("network_error", status)
+                failure = ClientError("unavailable", status)
             except ClientError as error:
                 if (
                     refresh
@@ -372,7 +372,7 @@ class AsyncHTTP:
                     state.finish()
                 failure = error
             if asyncio.get_running_loop().time() >= deadline:
-                failure = ClientError("timeout", status)
+                failure = ClientError("deadline_exceeded", status)
             if failure is not None:
                 failure._outcome_unknown = state.outcome_unknown
                 raise failure
@@ -382,7 +382,7 @@ class AsyncHTTP:
 class _Authenticated:
     def __init__(
         self,
-        owner: AsyncHTTP,
+        owner: AsyncHttpTransport,
         *,
         token: str | None = None,
         store: _SessionStore | None = None,

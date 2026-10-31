@@ -14,10 +14,11 @@ from typing import Any, Iterator, cast
 
 import pytest
 
-from chickinfry import HTTP, AsyncHTTP, ClientError
+from chickinfry import AsyncHttpTransport, ClientError, HttpTransport
 from chickinfry import _device as device
 from chickinfry._device import _device_store, _DeviceStore, _Record
-from chickinfry.session import SessionStore, _SessionStore
+from chickinfry.errors import _storage_error
+from chickinfry.session import MemoryStore, _SessionStore
 
 from .peer import Peer, Received, json_bytes, respond
 from .test_session import credentials
@@ -99,11 +100,11 @@ def test_real_interpreter_restart(mode: str, tmp_path: Path) -> None:
             root,
             """
 import asyncio
-from chickinfry import HTTP, AsyncHTTP
+from chickinfry import HttpTransport, AsyncHttpTransport
 async def run():
     assert s.credentials() is not None
     assert s._attempt('screen-a') is not None and s._attempt('screen-b') is None
-    owner=AsyncHTTP(s._origin) if sys.argv[2]=='async' else HTTP(s._origin)
+    owner=AsyncHttpTransport(s._origin) if sys.argv[2]=='async' else HttpTransport(s._origin)
     owner.with_session(s)
     if sys.argv[2]=='async': await owner.aclose()
     else: owner.close()
@@ -164,33 +165,6 @@ def test_explicit_off_and_directory_without_optional_modules(
 
 
 @pytest.mark.parametrize(
-    "reason,message",
-    [
-        (
-            "device_storage_unavailable",
-            "Could not use device storage for the session. Check that the storage location is writable, or set persist to another directory or turn it off.",
-        ),
-        (
-            "device_storage_corrupt",
-            "Stored session data could not be read. Sign out to clear it, then sign in again.",
-        ),
-        (
-            "device_storage_full",
-            "Device storage for sign-in is full. Finish or cancel pending sign-ups, then try again.",
-        ),
-        (
-            "device_storage_version_unsupported",
-            "Stored session data was written by a newer SDK. Update the SDK, or sign out and sign in again.",
-        ),
-    ],
-)
-def test_device_reason_and_exact_message(reason: str, message: str) -> None:
-    error = ClientError(reason)
-    assert error.reason == reason and error.status is None
-    assert str(error) == message
-
-
-@pytest.mark.parametrize(
     "damage",
     [
         "permission",
@@ -213,21 +187,21 @@ def test_unsafe_or_corrupt_original_is_preserved(damage: str, tmp_path: Path) ->
     s = store_at(root)
     s.replace(credentials())
     path = bundle(s)
-    reason = "device_storage_corrupt"
+    reason = "data_loss"
     if damage == "permission":
         path.chmod(0o644)
-        reason = "device_storage_unavailable"
+        reason = "failed_precondition"
     elif damage == "directory":
         root.chmod(0o777)
-        reason = "device_storage_unavailable"
+        reason = "failed_precondition"
     elif damage == "symlink":
         original = path.with_suffix(".original")
         path.rename(original)
         path.symlink_to(original)
-        reason = "device_storage_unavailable"
+        reason = "failed_precondition"
     elif damage == "hardlink":
         os.link(path, path.with_suffix(".linked"))
-        reason = "device_storage_unavailable"
+        reason = "failed_precondition"
     elif damage == "corrupt":
         path.write_bytes(b"invalid JSON")
     elif damage == "duplicate":
@@ -236,7 +210,7 @@ def test_unsafe_or_corrupt_original_is_preserved(damage: str, tmp_path: Path) ->
         state = json.loads(path.read_bytes())
         if damage in {"newer", "unknown"}:
             state["version"] = 99 if damage == "newer" else 0
-            reason = "device_storage_version_unsupported"
+            reason = "unimplemented"
         elif damage == "scope":
             state["scope"] = "another owner"
         elif damage == "fields":
@@ -250,7 +224,7 @@ def test_unsafe_or_corrupt_original_is_preserved(damage: str, tmp_path: Path) ->
             state["generation"] = device._MAX_INT + 1
         path.write_text(json.dumps(state))
     before = path.read_bytes()
-    with pytest.raises(ClientError, check=lambda e: e.reason == reason):
+    with pytest.raises(ClientError, check=lambda e: e.code == reason):
         store_at(root).credentials()
     assert bool(path.read_bytes() == before)
 
@@ -410,16 +384,16 @@ async def test_lost_refresh_response_does_not_resend_after_restart(
         root = tmp_path / "state"
         script = f"""
 import asyncio
-from chickinfry import HTTP,AsyncHTTP,ClientError
+from chickinfry import HttpTransport,AsyncHttpTransport,ClientError
 s=store_at(Path(sys.argv[1]),origin={peer.origin!r})
 if s.credentials() is None:s.replace(credentials())
 async def run():
     if sys.argv[2]=='async':
-        async with AsyncHTTP(s._origin) as t:
+        async with AsyncHttpTransport(s._origin) as t:
             try:await t.with_session(s).invoke('probe.echo',{{}})
             except ClientError:pass
     else:
-        with HTTP(s._origin) as t:
+        with HttpTransport(s._origin) as t:
             try:t.with_session(s).invoke('probe.echo',{{}})
             except ClientError:pass
 asyncio.run(run())
@@ -449,17 +423,17 @@ async def test_refresh_record_failure_preserves_reason_and_prevents_send(
 
         monkeypatch.setattr(s, "_write", fail)
         if mode == "async":
-            async with AsyncHTTP(peer.origin) as transport:
+            async with AsyncHttpTransport(peer.origin) as transport:
                 with pytest.raises(
-                    ClientError, check=lambda e: e.reason == "device_storage_full"
+                    ClientError, check=lambda e: e.code == "resource_exhausted"
                 ):
                     await transport.with_session(s).invoke("probe.echo", {})
         else:
 
             def run() -> None:
-                with HTTP(peer.origin) as transport:
+                with HttpTransport(peer.origin) as transport:
                     with pytest.raises(
-                        ClientError, check=lambda e: e.reason == "device_storage_full"
+                        ClientError, check=lambda e: e.code == "resource_exhausted"
                     ):
                         transport.with_session(s).invoke("probe.echo", {})
 
@@ -475,10 +449,10 @@ def test_same_files_across_threads_and_event_loops(tmp_path: Path) -> None:
         async def one() -> None:
             s = store_at(root)
             if mode == "sync":
-                with HTTP(s._origin) as transport:
+                with HttpTransport(s._origin) as transport:
                     transport.with_session(s)
             else:
-                async with AsyncHTTP(s._origin) as transport:
+                async with AsyncHttpTransport(s._origin) as transport:
                     transport.with_session(s)
             assert s.credentials() is not None
 
@@ -540,12 +514,12 @@ async def test_post_login_write_failure_is_success_only_for_this_run(
         assert s._accept_login(new, user_id=new.user_id, expected_generation=0)
         assert bool(s.credentials() == new)
         if mode == "async":
-            async with AsyncHTTP(peer.origin) as transport:
+            async with AsyncHttpTransport(peer.origin) as transport:
                 await transport.with_session(s).invoke("probe.echo", {})
         else:
 
             def run() -> None:
-                with HTTP(peer.origin) as transport:
+                with HttpTransport(peer.origin) as transport:
                     transport.with_session(s).invoke("probe.echo", {})
 
             await asyncio.to_thread(run)
@@ -570,9 +544,7 @@ def test_location_creation_failure_is_not_memory_success(tmp_path: Path) -> None
     root.write_text("not a directory")
     s = store_at(root)
     new = credentials()
-    with pytest.raises(
-        ClientError, check=lambda e: e.reason == "device_storage_unavailable"
-    ):
+    with pytest.raises(ClientError, check=lambda e: e.code == "failed_precondition"):
         s._accept_login(new, user_id=new.user_id, expected_generation=0)
 
 
@@ -590,7 +562,7 @@ def test_attempt_cap_prunes_only_auth_selected_screens(
     for index in range(3):
         assert s._save_attempt(str(index), attempt(), expected_generation=s._generation)
     before = s._generation
-    with pytest.raises(ClientError, check=lambda e: e.reason == "device_storage_full"):
+    with pytest.raises(ClientError, check=lambda e: e.code == "resource_exhausted"):
         s._save_attempt("fourth", attempt(), expected_generation=before)
     assert s._generation == before and all(
         s._attempt(str(index)) is not None for index in range(3)
@@ -626,7 +598,7 @@ def test_serialized_bundle_exact_byte_boundary(tmp_path: Path) -> None:
         environment="test",
         path=root,
     )
-    with pytest.raises(ClientError, check=lambda e: e.reason == "device_storage_full"):
+    with pytest.raises(ClientError, check=lambda e: e.code == "resource_exhausted"):
         over.replace(old)
     assert not bundle(over).exists()
 
@@ -642,13 +614,13 @@ async def test_request_bearer_is_never_persisted(mode: str, tmp_path: Path) -> N
 
     async with Peer(handler) as peer:
         if mode == "async":
-            async with AsyncHTTP(peer.origin) as transport:
+            async with AsyncHttpTransport(peer.origin) as transport:
                 await transport.with_bearer(token).invoke("probe.echo", {})
                 await transport.invoke("probe.echo", {})
         else:
 
             def run() -> None:
-                with HTTP(peer.origin) as transport:
+                with HttpTransport(peer.origin) as transport:
                     transport.with_bearer(token).invoke("probe.echo", {})
                     transport.invoke("probe.echo", {})
 
@@ -658,7 +630,7 @@ async def test_request_bearer_is_never_persisted(mode: str, tmp_path: Path) -> N
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
 async def test_transport_accepts_structural_store(mode: str) -> None:
-    original = SessionStore("https://example.com", credentials())
+    original = MemoryStore("https://example.com", credentials())
     names = (
         "_condition",
         "_blocked_generation",
@@ -679,12 +651,12 @@ async def test_transport_accepts_structural_store(mode: str) -> None:
         "_settled",
     )
     structural = SimpleNamespace(**{name: getattr(original, name) for name in names})
-    assert not isinstance(structural, SessionStore)
+    assert not isinstance(structural, MemoryStore)
     if mode == "async":
-        async with AsyncHTTP(original._origin) as transport:
+        async with AsyncHttpTransport(original._origin) as transport:
             transport.with_session(cast(_SessionStore, structural))
     else:
-        with HTTP(original._origin) as transport:
+        with HttpTransport(original._origin) as transport:
             transport.with_session(cast(_SessionStore, structural))
 
 
@@ -728,7 +700,7 @@ def test_windows_acl_boundary_with_fake(
         checked.append(path)
         expected = 0o700 if path.is_dir() else 0o600
         if path.stat().st_mode & 0o777 != expected:
-            raise ClientError("device_storage_unavailable")
+            raise ClientError("failed_precondition")
 
     @contextmanager
     def lock(descriptor: int) -> Iterator[None]:
@@ -759,7 +731,7 @@ def test_windows_acl_boundary_with_fake(
 
         monkeypatch.setattr(device, "_open_private", open_after_swap)
         with pytest.raises(
-            ClientError, check=lambda e: e.reason == "device_storage_unavailable"
+            ClientError, check=lambda e: e.code == "failed_precondition"
         ):
             s.replace(old)
         assert swapped
@@ -784,18 +756,18 @@ async def test_constructor_persist_settings_reach_private_store(
 ) -> None:
     root = tmp_path / "selected"
     owner = (
-        HTTP("https://example.com", persist={"dir": root})
+        HttpTransport("https://example.com", persist={"dir": root})
         if mode == "sync"
-        else AsyncHTTP("https://example.com", persist={"dir": root})
+        else AsyncHttpTransport("https://example.com", persist={"dir": root})
     )
     assert not root.exists()
     s = owner._device_store(app="app", project="project", environment="test")
     s.replace(credentials())
     assert root.is_dir() and list(root.glob("*.json"))
     off = (
-        HTTP("https://example.com", persist=False)
+        HttpTransport("https://example.com", persist=False)
         if mode == "sync"
-        else AsyncHTTP("https://example.com", persist=False)
+        else AsyncHttpTransport("https://example.com", persist=False)
     )
     memory = off._device_store(app="app", project="project", environment="test")
     before = list(tmp_path.rglob("*"))
@@ -803,7 +775,7 @@ async def test_constructor_persist_settings_reach_private_store(
     assert memory.credentials() is not None
     assert list(tmp_path.rglob("*")) == before
     for transport in (owner, off):
-        if isinstance(transport, HTTP):
+        if isinstance(transport, HttpTransport):
             transport.close()
         else:
             await transport.aclose()
@@ -811,9 +783,9 @@ async def test_constructor_persist_settings_reach_private_store(
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
 def test_constructor_rejects_old_path_key(mode: str, tmp_path: Path) -> None:
-    constructor = HTTP if mode == "sync" else AsyncHTTP
+    constructor = HttpTransport if mode == "sync" else AsyncHttpTransport
     with pytest.raises(
-        ClientError, check=lambda error: error.reason == "invalid_input"
+        ClientError, check=lambda error: error.code == "invalid_argument"
     ):
         constructor("https://example.com", persist={"path": tmp_path})
 
@@ -867,14 +839,14 @@ async def test_refresh_commit_failure_keeps_memory_and_restart_marker(
 
         monkeypatch.setattr(s, "_write", write)
         if mode == "async":
-            async with AsyncHTTP(peer.origin) as transport:
+            async with AsyncHttpTransport(peer.origin) as transport:
                 assert await transport.with_session(s).invoke("probe.echo", {}) == {
                     "ok": True
                 }
         else:
 
             def run() -> None:
-                with HTTP(peer.origin) as transport:
+                with HttpTransport(peer.origin) as transport:
                     assert transport.with_session(s).invoke("probe.echo", {}) == {
                         "ok": True
                     }
@@ -887,16 +859,16 @@ async def test_refresh_commit_failure_keeps_memory_and_restart_marker(
         assert restored._blocked_generation == restored._generation
         script = f"""
 import asyncio
-from chickinfry import HTTP, AsyncHTTP, OperationError
+from chickinfry import HttpTransport, AsyncHttpTransport, OperationError
 s=store_at(Path(sys.argv[1]),origin={peer.origin!r})
 async def run():
     if sys.argv[2]=="async":
-        async with AsyncHTTP(s._origin) as t:
+        async with AsyncHttpTransport(s._origin) as t:
             try:await t.with_session(s).invoke("probe.echo",{{}})
             except OperationError:pass
             else:raise AssertionError
     else:
-        with HTTP(s._origin) as t:
+        with HttpTransport(s._origin) as t:
             try:t.with_session(s).invoke("probe.echo",{{}})
             except OperationError:pass
             else:raise AssertionError
@@ -1047,9 +1019,9 @@ async def test_relative_directory_is_bound_at_construction(
     later.mkdir()
     monkeypatch.chdir(initial)
     owner = (
-        HTTP("https://example.com", persist={"dir": "state"})
+        HttpTransport("https://example.com", persist={"dir": "state"})
         if mode == "sync"
-        else AsyncHTTP("https://example.com", persist={"dir": "state"})
+        else AsyncHttpTransport("https://example.com", persist={"dir": "state"})
     )
     assert not (initial / "state").exists()
     monkeypatch.chdir(later)
@@ -1057,7 +1029,7 @@ async def test_relative_directory_is_bound_at_construction(
     store.replace(credentials())
     assert isinstance(store, _DeviceStore) and store._directory == initial / "state"
     assert not (later / "state").exists()
-    if isinstance(owner, HTTP):
+    if isinstance(owner, HttpTransport):
         owner.close()
     else:
         await owner.aclose()
@@ -1065,9 +1037,9 @@ async def test_relative_directory_is_bound_at_construction(
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
 def test_empty_directory_is_rejected(mode: str) -> None:
-    constructor = HTTP if mode == "sync" else AsyncHTTP
+    constructor = HttpTransport if mode == "sync" else AsyncHttpTransport
     with pytest.raises(
-        ClientError, check=lambda error: error.reason == "device_storage_unavailable"
+        ClientError, check=lambda error: error.code == "failed_precondition"
     ):
         constructor("https://example.com", persist={"dir": ""})
 
@@ -1118,9 +1090,7 @@ def test_read_acl_is_refused_before_session_use(
         check=False,
     )
     assert result.returncode == 0
-    with pytest.raises(
-        ClientError, check=lambda e: e.reason == "device_storage_unavailable"
-    ):
+    with pytest.raises(ClientError, check=lambda e: e.code == "failed_precondition"):
         if inherited:
             store.replace(credentials())
         else:
@@ -1201,7 +1171,7 @@ def test_memory_overlay_rechecks_persisted_auth_boundary(
             other.replace(
                 replace(credentials(), user_id="new-user", session_id="new-session")
             )
-        with pytest.raises(ClientError, check=lambda e: e.reason == "invalid_session"):
+        with pytest.raises(ClientError, check=lambda e: e.code == "unauthenticated"):
             store._register()
         assert store._credentials is None
         assert not store._volatile
@@ -1224,7 +1194,7 @@ def test_writable_parent_or_swapped_directory_cannot_redirect_store(
     if attack == "writable-parent":
         parent.chmod(0o777)
         with pytest.raises(
-            ClientError, check=lambda e: e.reason == "device_storage_unavailable"
+            ClientError, check=lambda e: e.code == "failed_precondition"
         ):
             store.replace(credentials())
     else:
@@ -1243,7 +1213,7 @@ def test_writable_parent_or_swapped_directory_cannot_redirect_store(
         try:
             store.replace(credentials())
         except ClientError as error:
-            assert error.reason == "device_storage_unavailable"
+            assert error.code == "failed_precondition"
         assert swapped
         assert not list(target.glob("*.json"))
 
@@ -1346,11 +1316,11 @@ async def test_automatic_refresh_preserves_credentials_after_attempt_write(
 
         async def call() -> object:
             if mode == "async":
-                async with AsyncHTTP(peer.origin) as transport:
+                async with AsyncHttpTransport(peer.origin) as transport:
                     return await transport.with_session(store).invoke("probe.echo", {})
 
             def sync() -> object:
-                with HTTP(peer.origin) as transport:
+                with HttpTransport(peer.origin) as transport:
                     return transport.with_session(store).invoke("probe.echo", {})
 
             return await asyncio.to_thread(sync)
@@ -1425,9 +1395,7 @@ def test_auth_marker_write_failure_sends_no_rpc(
         )
         sends += 1
 
-    with pytest.raises(
-        ClientError, check=lambda e: e.reason == "device_storage_unavailable"
-    ):
+    with pytest.raises(ClientError, check=lambda e: e.code == "failed_precondition"):
         login()
     assert sends == 0
 
@@ -1569,6 +1537,7 @@ def test_first_login_does_not_write_auth_marker(
 async def test_call_never_replays_under_switched_account(
     mode: str, stage: str, persist: bool, tmp_path: Path
 ) -> None:
+    expected_code = "unauthenticated" if stage == "original" else "failed_precondition"
     old = credentials()
     rotated = replace(credentials(), user_id=old.user_id, session_id=old.session_id)
     other_account = replace(credentials(), user_id="new-user", session_id="new-session")
@@ -1612,24 +1581,26 @@ async def test_call_never_replays_under_switched_account(
         store.replace(old)
 
         async def run() -> None:
-            async with AsyncHTTP(peer.origin) as transport:
+            async with AsyncHttpTransport(peer.origin) as transport:
                 client = transport.with_session(store)
                 with pytest.raises(
-                    ClientError, check=lambda e: e.reason == "invalid_session"
-                ):
+                    ClientError, check=lambda e: e.code == expected_code
+                ) as caught:
                     await client.invoke("probe.echo", {"value": "original"})
+                assert caught.value.status is None
                 assert other_sends == 0
                 assert await client.invoke("probe.echo", {"value": "next"}) == {
                     "ok": True
                 }
 
         def sync() -> None:
-            with HTTP(peer.origin) as transport:
+            with HttpTransport(peer.origin) as transport:
                 client = transport.with_session(store)
                 with pytest.raises(
-                    ClientError, check=lambda e: e.reason == "invalid_session"
-                ):
+                    ClientError, check=lambda e: e.code == expected_code
+                ) as caught:
                     client.invoke("probe.echo", {"value": "original"})
+                assert caught.value.status is None
                 assert other_sends == 0
                 assert client.invoke("probe.echo", {"value": "next"}) == {"ok": True}
 
@@ -1668,12 +1639,12 @@ async def test_refresh_rejection_clears_after_attempt_reread(
         store.replace(credentials())
 
         async def run() -> None:
-            async with AsyncHTTP(peer.origin) as transport:
+            async with AsyncHttpTransport(peer.origin) as transport:
                 with pytest.raises(ClientError):
                     await transport.with_session(store).invoke("probe.echo", {})
 
         def sync() -> None:
-            with HTTP(peer.origin) as transport:
+            with HttpTransport(peer.origin) as transport:
                 with pytest.raises(ClientError):
                     transport.with_session(store).invoke("probe.echo", {})
 
@@ -1742,14 +1713,14 @@ async def test_refresh_success_survives_commit_reread_failure(
         monkeypatch.setattr(store, "_read", read_or_fail)
         monkeypatch.setattr(store, "_accept_login", conflict)
         if mode == "async":
-            async with AsyncHTTP(peer.origin) as transport:
+            async with AsyncHttpTransport(peer.origin) as transport:
                 assert await transport.with_session(store).invoke("probe.echo", {}) == {
                     "ok": True
                 }
         else:
 
             def sync() -> object:
-                with HTTP(peer.origin) as transport:
+                with HttpTransport(peer.origin) as transport:
                     return transport.with_session(store).invoke("probe.echo", {})
 
             assert await asyncio.to_thread(sync) == {"ok": True}
@@ -1830,7 +1801,7 @@ def test_windows_directory_handles_with_native_fake(
     store = store_at(root)
     if reparse:
         with pytest.raises(
-            ClientError, check=lambda e: e.reason == "device_storage_unavailable"
+            ClientError, check=lambda e: e.code == "failed_precondition"
         ):
             store.replace(credentials())
         assert not list(root.glob("*.json"))
@@ -1853,9 +1824,9 @@ def test_refresh_io_fallback_does_not_override_confirmed_boundary(
     store._begin_refresh(previous, generation)
     rotated = replace(credentials(), user_id=old.user_id, session_id=old.session_id)
     reason = {
-        "corrupt": "device_storage_corrupt",
-        "version": "device_storage_version_unsupported",
-        "known-switch": "device_storage_unavailable",
+        "corrupt": "data_loss",
+        "version": "unimplemented",
+        "known-switch": "failed_precondition",
     }[boundary]
     if boundary == "known-switch":
         store.replace(
@@ -1866,9 +1837,62 @@ def test_refresh_io_fallback_does_not_override_confirmed_boundary(
         raise ClientError(reason)
 
     monkeypatch.setattr(store, "_read", fail)
-    expected = "invalid_session" if boundary == "known-switch" else reason
-    with pytest.raises(ClientError, check=lambda e: e.reason == expected):
+    expected = "failed_precondition" if boundary == "known-switch" else reason
+    with pytest.raises(ClientError, check=lambda e: e.code == expected):
         store._apply_refresh(previous, generation, rotated, None)
     assert not store._volatile
     matches = store._credentials == rotated
     assert not matches
+
+
+def test_refresh_precondition_does_not_become_storage_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = store_at(tmp_path / "state")
+    old = credentials()
+    store.replace(old)
+    previous = store.credentials()
+    assert previous is not None
+    generation = store._generation
+    store._begin_refresh(previous, generation)
+    read = store._snapshot
+    before = bundle(store).read_bytes()
+
+    def unknown_auth() -> dict[str, object]:
+        return {**read(), "auth_unknown": True}
+
+    monkeypatch.setattr(store, "_snapshot", unknown_auth)
+    rotated = replace(credentials(), user_id=old.user_id, session_id=old.session_id)
+    with pytest.raises(
+        ClientError, check=lambda error: error.code == "failed_precondition"
+    ):
+        store._apply_refresh(previous, generation, rotated, None)
+    assert not store._volatile and store._credentials == previous
+    assert bundle(store).read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "code,message",
+    [
+        (
+            "failed_precondition",
+            "Could not use device storage for the session. Check that the storage location is writable, or set persist to another directory or turn it off.",
+        ),
+        (
+            "data_loss",
+            "Stored session data could not be read. Sign out to clear it, then sign in again.",
+        ),
+        (
+            "resource_exhausted",
+            "Device storage for sign-in is full. Finish or cancel pending sign-ups, then try again.",
+        ),
+        (
+            "unimplemented",
+            "Stored session data was written by a newer SDK. Update the SDK, or sign out and sign in again.",
+        ),
+    ],
+)
+def test_device_reason_and_exact_message(code: str, message: str) -> None:
+    error = _storage_error(code)
+    assert error.code == code and error.status is None
+    assert str(error) == message

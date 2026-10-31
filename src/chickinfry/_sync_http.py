@@ -21,7 +21,7 @@ from ._http_common import (
 from ._origin import canonical_origin
 from ._request_logs import _request_logs
 from ._request_state import _RequestState, _state
-from .errors import ClientError, OperationError
+from .errors import ClientError, OperationError, _local_error
 from .session import (
     SessionCredentials,
     _Failure,
@@ -38,10 +38,10 @@ if TYPE_CHECKING:
 
 def _check_deadline(deadline: float) -> None:
     if time.monotonic() >= deadline:
-        raise ClientError("timeout")
+        raise ClientError("deadline_exceeded")
 
 
-class SyncClientTransport(Protocol):
+class Transport(Protocol):
     """The synchronous operation contract consumed by generated clients."""
 
     def invoke(self, operation: str, payload: bytes | Mapping[str, object]) -> object:
@@ -49,7 +49,7 @@ class SyncClientTransport(Protocol):
         ...
 
 
-class HTTP:
+class HttpTransport:
     """An origin-bound synchronous transport with a pool shared safely by threads."""
 
     def __init__(
@@ -74,10 +74,10 @@ class HTTP:
         else:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not self._lock.acquire(timeout=remaining):
-                raise ClientError("timeout")
+                raise ClientError("deadline_exceeded")
         try:
             if self._closed:
-                raise ClientError("transport_closed")
+                raise _local_error("failed_precondition", "transport_closed")
             if deadline is not None:
                 _check_deadline(deadline)
             yield
@@ -130,16 +130,16 @@ class HTTP:
             persist=self._persist,
         )
 
-    def with_bearer(self, token: str) -> SyncClientTransport:
+    def with_bearer(self, token: str) -> Transport:
         with self._locked():
             if not _valid_token(token):
-                raise ClientError("invalid_token")
+                raise _local_error("invalid_argument", "invalid_token")
             return _Authenticated(self, token=token)
 
-    def with_session(self, store: _SessionStore) -> SyncClientTransport:
+    def with_session(self, store: _SessionStore) -> Transport:
         with self._locked():
             if not isinstance(store, _SessionStore):
-                raise ClientError("invalid_session")
+                raise ClientError("failed_precondition")
         store._attach("sync", self._origin)
         return _Authenticated(self, store=store)
 
@@ -244,7 +244,7 @@ class HTTP:
                         generation,
                         flight,
                         None,
-                        _Failure("network_error", retryable=True),
+                        _Failure("unavailable", retryable=True),
                     )
                 else:
                     self._watch_start(store, snapshot, generation, flight)
@@ -263,7 +263,8 @@ class HTTP:
                 now = time.monotonic()
                 if now >= flight.deadline:
                     flight.result = _Failure(
-                        "timeout", outcome_unknown=flight.request_state.outcome_unknown
+                        "deadline_exceeded",
+                        outcome_unknown=flight.request_state.outcome_unknown,
                     )
                     store._apply_refresh(snapshot, generation, None, flight.result)
                     flight.settled = True
@@ -271,7 +272,7 @@ class HTTP:
                     break
                 remaining = min(deadline, flight.deadline) - now
                 if remaining <= 0:
-                    raise ClientError("timeout")
+                    raise ClientError("deadline_exceeded")
                 store._condition.wait(remaining)
                 _check_deadline(deadline)
             result = flight.result
@@ -312,7 +313,8 @@ class HTTP:
         with store._locked():
             if not flight.settled:
                 flight.result = _Failure(
-                    "timeout", outcome_unknown=flight.request_state.outcome_unknown
+                    "deadline_exceeded",
+                    outcome_unknown=flight.request_state.outcome_unknown,
                 )
                 store._apply_refresh(snapshot, generation, None, flight.result)
                 flight.settled = True
@@ -328,7 +330,7 @@ class HTTP:
         hook: _Observation | None = None,
     ) -> None:
         credentials: SessionCredentials | None = None
-        failure: _Failure | None = _Failure("network_error")
+        failure: _Failure | None = _Failure("unavailable")
         observation = _state.set(flight.request_state)
         registration = _observer.set(hook) if hook is not None else None
         try:
@@ -347,9 +349,9 @@ class HTTP:
         except ClientError as error:
             failure = _Failure.from_error(error)
         except _HookError:
-            failure = _Failure("network_error", retryable=True, hook_failed=True)
+            failure = _Failure("unavailable", retryable=True, hook_failed=True)
         except BaseException:
-            failure = _Failure("network_error")
+            failure = _Failure("unavailable")
         finally:
             _state.reset(observation)
             self._publish(store, snapshot, generation, flight, credentials, failure)
@@ -369,7 +371,7 @@ class HTTP:
             if not flight.settled:
                 if time.monotonic() >= flight.deadline:
                     failure = _Failure(
-                        "timeout",
+                        "deadline_exceeded",
                         failure.status if failure is not None else None,
                         outcome_unknown=flight.request_state.outcome_unknown,
                         hook_failed=failure.hook_failed
@@ -445,7 +447,7 @@ class HTTP:
                                 observation.notify("redirect", response)
                             if not refresh:
                                 state.finish()
-                            raise OperationError("redirect_not_allowed", status)
+                            raise _local_error("internal", "operation_failed", status)
                         decoder = _Body(
                             response.headers.get("content-encoding", "identity"), status
                         )
@@ -463,7 +465,7 @@ class HTTP:
                             try:
                                 decoded = _read_credentials(value)
                             except ClientError:
-                                reason = "invalid_response"
+                                reason = "internal"
                             else:
                                 _remaining()
                                 state.finish()
@@ -478,7 +480,7 @@ class HTTP:
                 ) as error:
                     if observation is not None:
                         observation.details.extend((type(error).__name__, str(error)))
-                    reason = "timeout"
+                    reason = "deadline_exceeded"
                 except (
                     httpcore.NetworkError,
                     httpcore.ProtocolError,
@@ -489,7 +491,7 @@ class HTTP:
                 ) as error:
                     if observation is not None:
                         observation.details.extend((type(error).__name__, str(error)))
-                    reason = "network_error"
+                    reason = "unavailable"
                 except ClientError as error:
                     if (
                         refresh
@@ -512,7 +514,7 @@ class HTTP:
 class _Authenticated:
     def __init__(
         self,
-        owner: HTTP,
+        owner: HttpTransport,
         *,
         token: str | None = None,
         store: _SessionStore | None = None,

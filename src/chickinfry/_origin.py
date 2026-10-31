@@ -2,7 +2,7 @@ import ipaddress
 import re
 from urllib.parse import urlsplit
 
-from .errors import ClientError
+from .errors import _local_error
 
 
 def canonical_origin(origin: str) -> str:
@@ -12,7 +12,7 @@ def canonical_origin(origin: str) -> str:
         or any(ord(char) <= 32 or ord(char) == 127 for char in origin)
         or any(char in origin for char in "? #@\\%")
     ):
-        raise ClientError("invalid_origin")
+        raise _local_error("invalid_argument", "invalid_origin")
     result: str | None = None
     try:
         parsed = urlsplit(origin)
@@ -56,5 +56,5 @@ def canonical_origin(origin: str) -> str:
     except ValueError:
         pass
     if result is None:
-        raise ClientError("invalid_origin")
+        raise _local_error("invalid_argument", "invalid_origin")
     return result

@@ -8,38 +8,18 @@ import pytest
 
 from chickinfry import ClientError, OperationError
 from chickinfry._http_common import _response
-from chickinfry.errors import _MESSAGES
+from chickinfry.errors import _CODES, _MESSAGES, _storage_error
 from chickinfry.server import FieldError
 from chickinfry.session import _Failure
 
 
-@pytest.mark.parametrize(
-    "reason",
-    [
-        "invalid_origin",
-        "invalid_operation",
-        "invalid_input",
-        "invalid_token",
-        "invalid_session",
-        "origin_mismatch",
-        "invalid_timeout",
-        "invalid_response",
-        "request_too_large",
-        "response_too_large",
-        "timeout",
-        "network_error",
-        "unsupported_environment",
-        "wrong_event_loop",
-        "transport_closed",
-    ],
-)
-def test_each_client_reason_has_an_actionable_sentence(reason: str) -> None:
-    error = ClientError(reason, 503)
-    assert error.reason == reason and error.status == 503
+@pytest.mark.parametrize("code", sorted(_CODES))
+def test_each_client_code_has_an_actionable_sentence(code: str) -> None:
+    error = ClientError(code, 503)
+    assert error.code == code and error.status == 503
     message = str(error)
-    assert message == _MESSAGES[reason]
+    assert message == _MESSAGES[code]
     assert message.endswith(".") and message.count(".") == 1 and "; " in message
-    assert reason not in message
 
 
 @pytest.mark.parametrize(
@@ -59,10 +39,10 @@ def test_each_client_reason_has_an_actionable_sentence(reason: str) -> None:
 def test_operation_message_preserves_machine_code_and_status(code: str) -> None:
     error = OperationError(code, 409)
     expected = code if re.fullmatch(r"[a-z_]+", code) else "operation_failed"
-    assert error.code == expected and error.reason == "operation_failed"
+    assert error.code == expected
     assert error.status == 409
     message = str(error)
-    assert message == _MESSAGES[error.reason]
+    assert message == _MESSAGES["operation_failed"]
     assert message.endswith(".") and message.count(".") == 1 and "; " in message
     assert "HTTP status" in message and "error code" in message
 
@@ -73,9 +53,9 @@ def test_error_messages_do_not_include_untrusted_values() -> None:
     for value in values:
         local = ClientError(value, 503)
         operation = OperationError(value, 409)
-        assert local.reason == "network_error" and local.status == 503
+        assert local.code == "unknown" and local.status == 503
         assert operation.code == (token if value == token else "operation_failed")
-        assert operation.status == 409 and operation.reason == "operation_failed"
+        assert operation.status == 409
         visible = str(local) + repr(local) + str(operation) + repr(operation)
         assert all(secret not in visible for secret in values)
     for reason in _MESSAGES:
@@ -88,7 +68,7 @@ def test_error_messages_do_not_include_untrusted_values() -> None:
 
 
 def test_worker_message_explains_next_available_environment() -> None:
-    message = str(ClientError("unsupported_environment"))
+    message = str(ClientError("unimplemented"))
     assert message == (
         "This client does not support Python Workers yet (support is planned); "
         "make calls from a regular Python process for now."
@@ -193,3 +173,52 @@ def test_session_failure_snapshot_preserves_details_and_uncertainty() -> None:
     assert reconstructed.fields == (FieldError("quantity", "required"),)
     assert reconstructed._outcome_unknown and reconstructed._valid_error_envelope
     assert "Safe" not in str(reconstructed) + repr(reconstructed)
+
+
+def test_local_failure_uses_common_code_without_reason_alias() -> None:
+    error = ClientError("invalid_argument")
+    assert error.code == "invalid_argument"
+    assert error.status is None
+    assert not hasattr(error, "reason")
+    assert ClientError("unrecognized").code == "unknown"
+    assert ClientError("invalid_origin").code == "unknown"
+    for failure in (
+        ClientError("failed_precondition"),
+        _storage_error("failed_precondition"),
+    ):
+        restored = _Failure.from_error(failure).error()
+        assert type(restored) is ClientError
+        assert restored.code == "failed_precondition"
+        assert restored._storage_failure == failure._storage_failure
+        assert str(restored) == str(failure)
+
+
+@pytest.mark.parametrize(
+    "code,reason",
+    [
+        ("invalid_argument", "invalid_origin"),
+        ("invalid_argument", "invalid_operation"),
+        ("invalid_argument", "invalid_input"),
+        ("invalid_argument", "invalid_token"),
+        ("invalid_argument", "invalid_timeout"),
+        ("failed_precondition", "invalid_session"),
+        ("failed_precondition", "origin_mismatch"),
+        ("failed_precondition", "wrong_event_loop"),
+        ("failed_precondition", "transport_closed"),
+        ("resource_exhausted", "request_too_large"),
+        ("resource_exhausted", "response_too_large"),
+        ("deadline_exceeded", "timeout"),
+        ("unavailable", "network_error"),
+        ("unimplemented", "unsupported_environment"),
+        ("internal", "invalid_response"),
+    ],
+)
+def test_each_client_reason_has_an_actionable_sentence(code: str, reason: str) -> None:
+    from chickinfry.errors import _local_error
+
+    error = _local_error(code, reason, 503)
+    assert error.code == code and error.status == 503
+    message = str(error)
+    assert message == _MESSAGES[reason]
+    assert message.endswith(".") and message.count(".") == 1 and "; " in message
+    assert reason not in message

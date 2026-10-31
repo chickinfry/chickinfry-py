@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 import pytest
 
-from chickinfry import HTTP, AsyncHTTP, ClientError
+from chickinfry import AsyncHttpTransport, ClientError, HttpTransport
 from chickinfry._conformance import _Observation, _observer
 from conformance.driver.transport import Events, Transport, prepare, trace
 
@@ -303,7 +303,7 @@ async def test_live_redirect_byte_census(
     try:
         async with Peer(handler) as peer:
             if environment == "sync":
-                with HTTP(peer.origin, timeout=2) as owner:
+                with HttpTransport(peer.origin, timeout=2) as owner:
                     if prefetch:
                         owner._http_client().event_hooks["response"].append(
                             lambda response: response.read()
@@ -318,11 +318,7 @@ async def test_live_redirect_byte_census(
                                 Client(owner).probe.echo(
                                     ProbeEchoInput(wire_value="ok")
                                 )
-                            assert caught.value.reason == (
-                                "operation_failed"
-                                if status == 302
-                                else "invalid_response"
-                            ), (
+                            assert caught.value.code == "internal", (
                                 f"Census outcome differs: read={measured.read}, wire={measured.wire.offset}, expected={size}, checkpoints={len(comparisons)}"
                             )
                         finally:
@@ -330,7 +326,7 @@ async def test_live_redirect_byte_census(
 
                     await asyncio.to_thread(invoke)
             else:
-                async with AsyncHTTP(peer.origin, timeout=2) as async_owner:
+                async with AsyncHttpTransport(peer.origin, timeout=2) as async_owner:
                     import anyio
 
                     anyio.get_cancelled_exc_class()
@@ -348,9 +344,7 @@ async def test_live_redirect_byte_census(
                         await AsyncClient(async_owner).probe.echo(
                             ProbeEchoInput(wire_value="ok")
                         )
-                    assert caught.value.reason == (
-                        "operation_failed" if status == 302 else "invalid_response"
-                    ), (
+                    assert caught.value.code == "internal", (
                         f"Census outcome differs: read={measured.read}, wire={measured.wire.offset}, expected={size}, checkpoints={len(comparisons)}"
                     )
         assert comparisons, "No live buffer checkpoint was reached"
@@ -410,7 +404,7 @@ async def test_transport_allocation_crosscheck(
     try:
         async with Peer(handler) as peer:
             if environment == "sync":
-                with HTTP(peer.origin, timeout=2) as owner:
+                with HttpTransport(peer.origin, timeout=2) as owner:
                     owner._http_client()
                     if not tracing_allocations:
                         tracemalloc.start(1)
@@ -419,11 +413,11 @@ async def test_transport_allocation_crosscheck(
                     def invoke() -> None:
                         with pytest.raises(ClientError) as caught:
                             Client(owner).probe.echo(ProbeEchoInput(wire_value="ok"))
-                        assert caught.value.reason == "invalid_response"
+                        assert caught.value.code == "internal"
 
                     await asyncio.to_thread(invoke)
             else:
-                async with AsyncHTTP(peer.origin, timeout=2) as async_owner:
+                async with AsyncHttpTransport(peer.origin, timeout=2) as async_owner:
                     import anyio
 
                     anyio.get_cancelled_exc_class()
@@ -435,7 +429,7 @@ async def test_transport_allocation_crosscheck(
                         await AsyncClient(async_owner).probe.echo(
                             ProbeEchoInput(wire_value="ok")
                         )
-                    assert caught.value.reason == "invalid_response"
+                    assert caught.value.code == "internal"
         filters = [
             tracemalloc.Filter(True, f"*/{name}/*", all_frames=True)
             for name in ("chickinfry", "httpx", "httpcore", "h11", "anyio")
@@ -736,7 +730,7 @@ async def test_every_body_read_path_publishes_once(
                 observation.notify("redirect", response)
 
             def sync_read() -> None:
-                with HTTP(peer.origin) as owner:
+                with HttpTransport(peer.origin) as owner:
                     with owner._http_client().stream("POST", peer.origin) as response:
                         entered(response)
                         if method == "read":
@@ -753,7 +747,7 @@ async def test_every_body_read_path_publishes_once(
             if environment == "sync":
                 await asyncio.to_thread(sync_read)
             else:
-                async with AsyncHTTP(peer.origin) as owner:
+                async with AsyncHttpTransport(peer.origin) as owner:
                     async with owner._http_client().stream(
                         "POST", peer.origin
                     ) as response:
