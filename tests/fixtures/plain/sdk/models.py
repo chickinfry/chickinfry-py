@@ -22,9 +22,9 @@ class ProbeEchoOutput:
 
 def _encodeProbeEchoInput(value: ProbeEchoInput) -> dict[_builtins.str, object]:
     if not isinstance(value, ProbeEchoInput):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     if not isinstance(value.wire_value, str):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     return {
         "wire_value": value.wire_value,
     }
@@ -50,9 +50,9 @@ class ProbeIdentifyOutput:
 
 def _encodeProbeIdentifyInput(value: ProbeIdentifyInput) -> dict[_builtins.str, object]:
     if not isinstance(value, ProbeIdentifyInput):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     if not isinstance(value.id, str):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     return {
         "id": value.id,
     }
@@ -93,7 +93,7 @@ class ProbeListOutput:
 
 def _encodeProbeListInput(value: ProbeListInput) -> dict[_builtins.str, object]:
     if not isinstance(value, ProbeListInput):
-        raise ClientError("invalid_input")
+        raise ClientError("invalid_argument")
     return {}
 
 

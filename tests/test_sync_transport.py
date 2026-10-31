@@ -16,10 +16,9 @@ import pytest
 from typing_extensions import Buffer
 
 from chickinfry import (
-    HTTP,
     ClientError,
-    OperationError,
-    SessionStore,
+    HttpTransport,
+    MemoryStore,
     _sync_http,
     _sync_network,
 )
@@ -45,8 +44,8 @@ async def test_sync_copies_security_and_owner_lifetime(
     monkeypatch.setenv("NO_PROXY", "")
     tokens = [secrets.token_urlsafe(32) for _ in range(2)]
     async with Peer(handler) as peer:
-        with HTTP(peer.origin) as owner:
-            store = SessionStore(peer.origin, credentials())
+        with HttpTransport(peer.origin) as owner:
+            store = MemoryStore(peer.origin, credentials())
             copies = [owner.with_bearer(token) for token in tokens] + [
                 owner.with_session(store)
             ]
@@ -78,20 +77,20 @@ async def test_sync_copies_security_and_owner_lifetime(
                 for copy in copies
             )
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "invalid_token"
+                ClientError, check=lambda error: error.code == "invalid_argument"
             ):
                 owner.with_bearer(tokens[0] + "\n")
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "origin_mismatch"
+                ClientError, check=lambda error: error.code == "failed_precondition"
             ):
-                owner.with_session(SessionStore("https://example.com", credentials()))
+                owner.with_session(MemoryStore("https://example.com", credentials()))
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "invalid_origin"
+                ClientError, check=lambda error: error.code == "invalid_argument"
             ):
-                HTTP("http://localhost")
+                HttpTransport("http://localhost")
         owner.close()
         with pytest.raises(
-            ClientError, check=lambda error: error.reason == "transport_closed"
+            ClientError, check=lambda error: error.code == "failed_precondition"
         ):
             copies[0].invoke("thing.run", {})
 
@@ -100,10 +99,10 @@ async def test_sync_copies_security_and_owner_lifetime(
     ("status", "body", "expected"),
     [
         (429, b'{"error":"rate_limited"}', "rate_limited"),
-        (503, b"server detail", "invalid_response"),
-        (401, b'{"error":"invalid_token\\n"}', "invalid_response"),
-        (307, b"secret detail", "redirect_not_allowed"),
-        (200, b"bad JSON detail", "invalid_response"),
+        (503, b"server detail", "internal"),
+        (401, b'{"error":"invalid_token\\n"}', "internal"),
+        (307, b"secret detail", "internal"),
+        (200, b"bad JSON detail", "internal"),
     ],
 )
 async def test_sync_errors_no_redirect_or_replay(
@@ -118,15 +117,11 @@ async def test_sync_errors_no_redirect_or_replay(
         )
 
     async with Peer(handler) as peer:
-        with HTTP(peer.origin) as owner:
+        with HttpTransport(peer.origin) as owner:
             with pytest.raises(ClientError) as caught:
                 await asyncio.to_thread(owner.invoke, "thing.run", {})
             assert caught.value.status == status
-            actual = (
-                caught.value.code
-                if isinstance(caught.value, OperationError)
-                else caught.value.reason
-            )
+            actual = caught.value.code
             assert actual == expected
             assert "detail" not in str(caught.value) + repr(caught.value)
             assert len(peer.received) == 1
@@ -169,11 +164,11 @@ async def test_sync_stream_limit_and_other_calls_survive(
                 disconnected.set()
 
     async with Peer(handler) as peer:
-        with HTTP(peer.origin) as owner:
+        with HttpTransport(peer.origin) as owner:
             if extra:
                 with pytest.raises(
                     ClientError,
-                    check=lambda error: error.reason == "response_too_large",
+                    check=lambda error: error.code == "resource_exhausted",
                 ):
                     await asyncio.to_thread(owner.invoke, "thing.large", {})
                 if not compressed:
@@ -199,10 +194,10 @@ async def test_sync_utf8_request_boundary_before_network() -> None:
         + b'"}'
     )
     async with Peer(handler) as peer:
-        with HTTP(peer.origin) as owner:
+        with HttpTransport(peer.origin) as owner:
             assert await asyncio.to_thread(owner.invoke, "thing.run", body) == {}
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "request_too_large"
+                ClientError, check=lambda error: error.code == "resource_exhausted"
             ):
                 owner.invoke("thing.run", body + b" ")
             assert len(peer.received) == 1 and len(peer.received[0].body) == limit
@@ -219,10 +214,10 @@ async def test_sync_real_clock_timeout_sanity() -> None:
         disconnected.set()
 
     async with Peer(handler) as peer:
-        with HTTP(peer.origin, timeout=1.0) as owner:
+        with HttpTransport(peer.origin, timeout=1.0) as owner:
             begin = time.monotonic()
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "timeout"
+                ClientError, check=lambda error: error.code == "deadline_exceeded"
             ):
                 await asyncio.wait_for(
                     asyncio.to_thread(owner.invoke, "thing.run", {}), 20
@@ -269,14 +264,18 @@ def test_sync_repeated_reads_keep_one_deadline(
 
     with (
         ObservedSocket() as sock,
-        HTTP("http://127.0.0.1", timeout=0.20 if tier == "request" else 10.0) as owner,
+        HttpTransport(
+            "http://127.0.0.1", timeout=0.20 if tier == "request" else 10.0
+        ) as owner,
     ):
         monkeypatch.setattr(
             _sync_network._Backend,
             "connect_tcp",
             lambda backend, *args, **kwargs: _sync_network._Stream(sock, backend),
         )
-        with pytest.raises(ClientError, check=lambda error: error.reason == "timeout"):
+        with pytest.raises(
+            ClientError, check=lambda error: error.code == "deadline_exceeded"
+        ):
             if tier == "request":
                 owner.invoke("thing.run", {})
             else:
@@ -312,10 +311,15 @@ def test_sync_tls_handshake_deadline(
         sync_clock.advance(0.05)
         return raw
 
-    with ObservedSocket() as sock, HTTP("https://127.0.0.1", timeout=0.20) as owner:
+    with (
+        ObservedSocket() as sock,
+        HttpTransport("https://127.0.0.1", timeout=0.20) as owner,
+    ):
         monkeypatch.setattr(_sync_network._Backend, "connect_tcp", connect)
         monkeypatch.setattr(ssl.SSLContext, "wrap_socket", wrap)
-        with pytest.raises(ClientError, check=lambda error: error.reason == "timeout"):
+        with pytest.raises(
+            ClientError, check=lambda error: error.code == "deadline_exceeded"
+        ):
             owner.invoke("thing.run", {})
         assert wrapped == pytest.approx([0.15])
         assert handshakes == pytest.approx([0.10])
@@ -340,7 +344,7 @@ def test_sync_pool_admission_deadline(
         def release(self, n: int = 1) -> None:
             releases.append(True)
 
-    with HTTP("http://127.0.0.1", timeout=0.20) as owner:
+    with HttpTransport("http://127.0.0.1", timeout=0.20) as owner:
         assert owner._client is not None
         owner._client.close()
         transport = _Transport(max_connections=1)
@@ -357,7 +361,9 @@ def test_sync_pool_admission_deadline(
 
         monkeypatch.setattr(owner, "_http_client", client)
         monkeypatch.setattr(transport._backend, "connect_tcp", unexpected_connect)
-        with pytest.raises(ClientError, check=lambda error: error.reason == "timeout"):
+        with pytest.raises(
+            ClientError, check=lambda error: error.code == "deadline_exceeded"
+        ):
             owner.invoke("thing.run", {})
         assert timeouts == pytest.approx([0.15])
         assert sync_clock.now == pytest.approx(0.20)
@@ -382,7 +388,7 @@ def test_sync_partial_writes_keep_one_deadline(
             return count
 
     with ObservedSocket() as sock:
-        with HTTP("http://127.0.0.1", timeout=0.20) as owner:
+        with HttpTransport("http://127.0.0.1", timeout=0.20) as owner:
             # Only transport clocks advance; runner scheduling cannot consume the budget.
             clock = SimpleNamespace(monotonic=lambda: now)
             monkeypatch.setattr(_sync_http, "time", clock)
@@ -393,7 +399,7 @@ def test_sync_partial_writes_keep_one_deadline(
                 lambda backend, *args, **kwargs: _sync_network._Stream(sock, backend),
             )
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "timeout"
+                ClientError, check=lambda error: error.code == "deadline_exceeded"
             ):
                 owner.invoke("thing.run", {"text": "a" * 32})
             assert timeouts == pytest.approx([0.20, 0.15, 0.10, 0.05])
@@ -409,7 +415,7 @@ async def test_sync_concurrent_init_close_interrupts_io_and_rejects_copies() -> 
         await request.reader.read()
 
     async with Peer(handler) as peer:
-        owner = HTTP(peer.origin)
+        owner = HttpTransport(peer.origin)
 
         def initialize() -> list[int]:
             with ThreadPoolExecutor(max_workers=8) as executor:
@@ -425,7 +431,7 @@ async def test_sync_concurrent_init_close_interrupts_io_and_rejects_copies() -> 
             await asyncio.wait_for(request, 1)
         owner.close()
         with pytest.raises(
-            ClientError, check=lambda error: error.reason == "transport_closed"
+            ClientError, check=lambda error: error.code == "failed_precondition"
         ):
             copy.invoke("thing.run", {})
         assert len(peer.received) == 1
@@ -435,16 +441,16 @@ async def test_sync_concurrent_init_close_interrupts_io_and_rejects_copies() -> 
 def test_sync_environment_rejects_before_http_libraries(environment: str) -> None:
     script = """
 import sys, types
-from chickinfry import HTTP, ClientError
+from chickinfry import HttpTransport, ClientError
 assert 'httpx' not in sys.modules and 'httpcore' not in sys.modules
 if sys.argv[1] == 'pyodide':
     sys.modules['pyodide'] = types.ModuleType('pyodide')
 else:
     sys.platform = sys.argv[1]
 try:
-    HTTP('http://127.0.0.1')
+    HttpTransport('http://127.0.0.1')
 except ClientError as error:
-    assert error.reason == 'unsupported_environment'
+    assert error.code == 'unimplemented'
 else:
     raise AssertionError
 assert 'httpx' not in sys.modules and 'httpcore' not in sys.modules
@@ -472,7 +478,7 @@ def test_sync_each_failed_address_uses_remaining_budget(
             sync_clock.advance(0.05)
             raise ConnectionRefusedError
 
-    with HTTP("http://127.0.0.1", timeout=0.20) as owner:
+    with HttpTransport("http://127.0.0.1", timeout=0.20) as owner:
         monkeypatch.setattr(
             _sync_network,
             "socket",
@@ -486,7 +492,9 @@ def test_sync_each_failed_address_uses_remaining_budget(
                 )
             ),
         )
-        with pytest.raises(ClientError, check=lambda error: error.reason == "timeout"):
+        with pytest.raises(
+            ClientError, check=lambda error: error.code == "deadline_exceeded"
+        ):
             owner.invoke("thing.run", {})
         assert timeouts == pytest.approx([0.20, 0.15, 0.10, 0.05])
         assert sync_clock.now == pytest.approx(0.20)
@@ -501,9 +509,9 @@ async def test_sync_malformed_network_error_hides_raw_exception() -> None:
         await writer.drain()
 
     async with Peer(handler) as peer:
-        with HTTP(peer.origin) as owner:
+        with HttpTransport(peer.origin) as owner:
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "network_error"
+                ClientError, check=lambda error: error.code == "unavailable"
             ) as caught:
                 await asyncio.to_thread(
                     owner.with_bearer(token).invoke, "thing.run", {"private": token}
@@ -544,9 +552,9 @@ async def test_sync_tls_verification_rejects_untrusted_certificate(
         await respond(writer)
 
     async with Peer(handler, ssl_context=context) as peer:
-        with HTTP(peer.origin.replace("http://", "https://", 1)) as owner:
+        with HttpTransport(peer.origin.replace("http://", "https://", 1)) as owner:
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "network_error"
+                ClientError, check=lambda error: error.code == "unavailable"
             ):
                 await asyncio.to_thread(owner.invoke, "thing.run", {})
             assert not peer.received
@@ -576,7 +584,7 @@ async def test_sync_reused_connection_gets_each_requests_new_deadline() -> None:
         raise AssertionError
 
     async with Peer(unused, raw_handler=raw) as peer:
-        with HTTP(peer.origin, timeout=0.20) as owner:
+        with HttpTransport(peer.origin, timeout=0.20) as owner:
             assert await asyncio.to_thread(owner.invoke, "thing.run", {}) == {}
             await asyncio.sleep(0.25)
             assert await asyncio.to_thread(owner.invoke, "thing.run", {}) == {}

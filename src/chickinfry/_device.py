@@ -13,10 +13,10 @@ from pathlib import Path
 from typing import Literal, cast
 from uuid import uuid4
 
-from .errors import ClientError
+from .errors import ClientError, _local_error, _storage_error
 from .session import (
+    MemoryStore,
     SessionCredentials,
-    SessionStore,
     _commit_device_refresh,
     _Failure,
     _read_credentials,
@@ -69,7 +69,7 @@ def _native(credentials: SessionCredentials) -> None:
         _time(credentials.expires_at)
         _time(credentials.refresh_expires_at)
     except (ValueError, OverflowError):
-        raise ClientError("invalid_session") from None
+        raise ClientError("failed_precondition") from None
 
 
 def _next_auth_generation(
@@ -93,7 +93,7 @@ def _location(app: str) -> Path:
     if _HOST == "win32":
         base = os.environ.get("LOCALAPPDATA")
         if not base or not Path(base).is_absolute():
-            raise ClientError("device_storage_unavailable")
+            raise _storage_error("failed_precondition")
         root = Path(base)
     else:
         home = os.environ.get("HOME")
@@ -102,7 +102,7 @@ def _location(app: str) -> Path:
             root = Path(state)
         else:
             if not home or not Path(home).is_absolute():
-                raise ClientError("device_storage_unavailable")
+                raise _storage_error("failed_precondition")
             root = (
                 Path(home) / "Library" / "Application Support"
                 if _HOST == "darwin"
@@ -114,11 +114,11 @@ def _location(app: str) -> Path:
 def _check_path(path: Path, *, directory: bool = False) -> None:
     info = path.lstat()
     if getattr(info, "st_file_attributes", 0) & 0x400:
-        raise ClientError("device_storage_unavailable")
+        raise _storage_error("failed_precondition")
     if stat.S_ISLNK(info.st_mode) or not (
         stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
     ):
-        raise ClientError("device_storage_unavailable")
+        raise _storage_error("failed_precondition")
     if _HOST == "win32":
         from ._device_windows import _check_acl
 
@@ -126,9 +126,9 @@ def _check_path(path: Path, *, directory: bool = False) -> None:
     elif info.st_uid != os.getuid() or (
         bool(info.st_mode & 0o022) if directory else stat.S_IMODE(info.st_mode) != 0o600
     ):
-        raise ClientError("device_storage_unavailable")
+        raise _storage_error("failed_precondition")
     if not directory and info.st_nlink != 1:
-        raise ClientError("device_storage_unavailable")
+        raise _storage_error("failed_precondition")
 
 
 def _check_acl(descriptor: int) -> None:
@@ -147,16 +147,16 @@ def _check_acl(descriptor: int) -> None:
     if not acl:
         if ctypes.get_errno() == errno.ENOENT:
             return
-        raise ClientError("device_storage_unavailable")
+        raise _storage_error("failed_precondition")
     try:
         entry, tag = ctypes.c_void_p(), ctypes.c_int()
         index = 0  # ACL_FIRST_ENTRY; Darwin's ACL_NEXT_ENTRY is -1.
         while libc.acl_get_entry(acl, index, ctypes.byref(entry)) == 0:
             if libc.acl_get_tag_type(entry, ctypes.byref(tag)) != 0 or tag.value == 1:
-                raise ClientError("device_storage_unavailable")
+                raise _storage_error("failed_precondition")
             index = -1
         if ctypes.get_errno() != errno.EINVAL:
-            raise ClientError("device_storage_unavailable")
+            raise _storage_error("failed_precondition")
     finally:
         libc.acl_free(acl)
 
@@ -166,15 +166,15 @@ def _check_directory(descriptor: int, *, ancestor: bool) -> None:
     if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (
         (0, os.getuid()) if ancestor else (os.getuid(),)
     ):
-        raise ClientError("device_storage_unavailable")
+        raise _storage_error("failed_precondition")
     if info.st_mode & 0o022 and not (ancestor and info.st_mode & stat.S_ISVTX):
-        raise ClientError("device_storage_unavailable")
+        raise _storage_error("failed_precondition")
     _check_acl(descriptor)
 
 
 def _directory(path: Path) -> int | None:
     if not path.is_absolute() or ".." in path.parts:
-        raise ClientError("device_storage_unavailable")
+        raise _storage_error("failed_precondition")
     if _HOST != "win32":
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         descriptor = os.open(path.anchor, flags)
@@ -197,7 +197,7 @@ def _directory(path: Path) -> int | None:
         if parent.is_symlink() or (
             parent.exists() and getattr(parent.lstat(), "st_file_attributes", 0) & 0x400
         ):
-            raise ClientError("device_storage_unavailable")
+            raise _storage_error("failed_precondition")
     missing: list[Path] = []
     parent = path
     while not parent.exists():
@@ -249,7 +249,7 @@ def _open_private(
                         not stat.S_ISDIR(info.st_mode)
                         or getattr(info, "st_file_attributes", 0) & 0x400
                     ):
-                        raise ClientError("device_storage_unavailable")
+                        raise _storage_error("failed_precondition")
         opened = os.fstat(descriptor)
         if directory is not None and (
             not stat.S_ISREG(opened.st_mode)
@@ -257,11 +257,11 @@ def _open_private(
             or stat.S_IMODE(opened.st_mode) != 0o600
             or opened.st_nlink != 1
         ):
-            raise ClientError("device_storage_unavailable")
+            raise _storage_error("failed_precondition")
         _check_acl(descriptor)
         current = os.stat(target, dir_fd=directory, follow_symlinks=False)
         if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
-            raise ClientError("device_storage_unavailable")
+            raise _storage_error("failed_precondition")
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -329,7 +329,7 @@ class _Record:
     directory: int | None = None
 
 
-class _DeviceSessionStore(SessionStore):
+class _DeviceSessionStore(MemoryStore):
     def __init__(self, origin: str) -> None:
         super().__init__(origin)
         self._auth_generation = 0
@@ -360,7 +360,7 @@ class _DeviceSessionStore(SessionStore):
             self._credentials is None
             or self._call_auth_generations.get(generation) != self._auth_generation
         ):
-            raise ClientError("invalid_session")
+            raise _local_error("unauthenticated", "invalid_session")
         return super()._new_credentials(generation)
 
 
@@ -380,7 +380,7 @@ class _DeviceStore(_DeviceSessionStore):
             not isinstance(value, str) or not value
             for value in (app, project, environment)
         ):
-            raise ClientError("invalid_input")
+            raise ClientError("invalid_argument")
         self._scope = json.dumps(
             [app, self._origin, project, environment], separators=(",", ":")
         )
@@ -400,7 +400,7 @@ class _DeviceStore(_DeviceSessionStore):
     @contextmanager
     def _transaction(self, *, block_on_failure: bool = False) -> Iterator[_Record]:
         if self._storage_blocked:
-            raise ClientError("device_storage_unavailable")
+            raise _storage_error("failed_precondition")
         failure: ClientError | None = None
         descriptor = None
         directory = None
@@ -437,11 +437,11 @@ class _DeviceStore(_DeviceSessionStore):
             failure = error
         except Exception as error:
             reason = (
-                "device_storage_full"
+                "resource_exhausted"
                 if isinstance(error, OSError) and error.errno in (28, 122)
-                else "device_storage_unavailable"
+                else "failed_precondition"
             )
-            failure = ClientError(reason)
+            failure = _storage_error(reason)
         finally:
             if descriptor is not None:
                 os.close(descriptor)
@@ -477,7 +477,7 @@ class _DeviceStore(_DeviceSessionStore):
             if type(state.get("version")) is not int:
                 raise ValueError
             if state["version"] != _VERSION:
-                raise ClientError("device_storage_version_unsupported")
+                raise _storage_error("unimplemented")
             state.setdefault("auth_unknown", False)
             if (
                 set(state)
@@ -522,11 +522,11 @@ class _DeviceStore(_DeviceSessionStore):
                 self._validate_attempt(screen, attempt)
             return state
         except ClientError as error:
-            if error.reason == "device_storage_version_unsupported":
+            if error.code == "unimplemented":
                 raise
         except (ValueError, TypeError, KeyError, RecursionError):
             pass
-        raise ClientError("device_storage_corrupt")
+        raise _storage_error("data_loss")
 
     def _write(self, record: _Record, state: dict[str, object]) -> None:
         raw = json.dumps(
@@ -536,7 +536,7 @@ class _DeviceStore(_DeviceSessionStore):
             not 0 <= cast(int, state[key]) <= _MAX_INT
             for key in ("generation", "auth_generation")
         ):
-            raise ClientError("device_storage_full")
+            raise _storage_error("resource_exhausted")
         if self._memory_record is None:
             assert self._path is not None
             _atomic_write(self._path, raw, directory=record.directory)
@@ -594,7 +594,7 @@ class _DeviceStore(_DeviceSessionStore):
         with self._locked():
             self._check_loop()
             if self._volatile:
-                raise ClientError("device_storage_unavailable")
+                raise _storage_error("failed_precondition")
             with self._transaction() as record:
                 state = self._restore(record)
                 self._load(state)
@@ -604,7 +604,7 @@ class _DeviceStore(_DeviceSessionStore):
         with self._locked():
             self._check_loop()
             if self._storage_blocked:
-                raise ClientError("device_storage_unavailable")
+                raise _storage_error("failed_precondition")
             try:
                 with self._transaction() as record:
                     state = self._restore(record)
@@ -620,10 +620,15 @@ class _DeviceStore(_DeviceSessionStore):
                         return None
                     self._load(state)
             except ClientError as error:
-                if self._volatile and error.reason in {
-                    "device_storage_unavailable",
-                    "device_storage_full",
-                }:
+                if (
+                    self._volatile
+                    and error._storage_failure
+                    and error.code
+                    in {
+                        "failed_precondition",
+                        "resource_exhausted",
+                    }
+                ):
                     return self._credentials
                 raise
             return self._credentials
@@ -631,9 +636,9 @@ class _DeviceStore(_DeviceSessionStore):
     def _attach(self, mode: Literal["sync", "async"], origin: str) -> None:
         with self._locked():
             if origin != self._origin:
-                raise ClientError("origin_mismatch")
+                raise _local_error("failed_precondition", "origin_mismatch")
             if self._mode is not None and self._mode != mode:
-                raise ClientError("invalid_session")
+                raise ClientError("failed_precondition")
             if self._mode is None and mode == "sync":
                 self._loop = None
             self.credentials()
@@ -699,7 +704,7 @@ class _DeviceStore(_DeviceSessionStore):
             or not isinstance(value, dict)
             or set(value) != {"attempt", "email", "started_at", "sequence"}
         ):
-            raise ClientError("invalid_input")
+            raise ClientError("invalid_argument")
         record = cast(dict[str, object], value)
         if (
             any(
@@ -709,7 +714,7 @@ class _DeviceStore(_DeviceSessionStore):
             or type(record["sequence"]) is not int
             or record["sequence"] < 0
         ):
-            raise ClientError("invalid_input")
+            raise ClientError("invalid_argument")
         if (
             len(screen_id) > _MAX_SCREEN
             or not screen_id.isascii()
@@ -717,11 +722,11 @@ class _DeviceStore(_DeviceSessionStore):
             or len(cast(str, record["email"])) > _MAX_EMAIL
             or record["sequence"] > _MAX_INT
         ):
-            raise ClientError("invalid_input")
+            raise ClientError("invalid_argument")
         try:
             _time(cast(str, record["started_at"]))
         except (ValueError, OverflowError):
-            raise ClientError("invalid_input") from None
+            raise ClientError("invalid_argument") from None
         return _Attempt(record)
 
     def _attempt(self, screen_id: str) -> _Attempt | None:
@@ -744,7 +749,7 @@ class _DeviceStore(_DeviceSessionStore):
         remove_screens: tuple[str, ...] = (),
     ) -> bool:
         if self._volatile:
-            raise ClientError("device_storage_unavailable")
+            raise _storage_error("failed_precondition")
         attempt = self._validate_attempt(screen_id, dict(value))
         with self._locked(), self._transaction() as record:
             state = self._read(record)
@@ -755,7 +760,7 @@ class _DeviceStore(_DeviceSessionStore):
             for screen in remove_screens:
                 attempts.pop(screen, None)
             if screen_id not in attempts and len(attempts) >= _MAX_ATTEMPTS:
-                raise ClientError("device_storage_full")
+                raise _storage_error("resource_exhausted")
             attempts[screen_id] = attempt
             state["generation"] = expected_generation + 1
             self._write(record, state)
@@ -770,7 +775,7 @@ class _DeviceStore(_DeviceSessionStore):
         expected_auth_generation: int,
     ) -> bool:
         if self._volatile:
-            raise ClientError("device_storage_unavailable")
+            raise _storage_error("failed_precondition")
         with self._locked(), self._transaction() as record:
             state = self._read(record)
             if (
@@ -797,11 +802,11 @@ class _DeviceStore(_DeviceSessionStore):
         auth_unknown: bool = False,
     ) -> bool:
         if self._volatile:
-            raise ClientError("device_storage_unavailable")
+            raise _storage_error("failed_precondition")
         if credentials is not None:
             _native(credentials)
             if user_id != credentials.user_id:
-                raise ClientError("invalid_input")
+                raise ClientError("invalid_argument")
         with self._locked(), self._transaction(block_on_failure=True) as record:
             state = self._read(record)
             if state["generation"] != expected_generation or (
@@ -819,14 +824,14 @@ class _DeviceStore(_DeviceSessionStore):
                     or state["session"] != asdict(credentials)
                     or screens != ()
                 ):
-                    raise ClientError("invalid_input")
+                    raise ClientError("invalid_argument")
                 if state["auth_unknown"] or state["refresh_unknown"]:
-                    raise ClientError("invalid_session")
+                    raise ClientError("failed_precondition")
                 state.update(auth_unknown=True, generation=expected_generation + 1)
                 try:
                     self._write(record, state)
                 except (ClientError, OSError):
-                    raise ClientError("device_storage_unavailable") from None
+                    raise _storage_error("failed_precondition") from None
                 self._auth_in_progress = (
                     cast(int, state["auth_generation"]),
                     state["session"],
@@ -870,7 +875,7 @@ class _DeviceStore(_DeviceSessionStore):
             persisted_session = asdict(self._credentials) if self._credentials else None
         _native(credentials)
         if user_id != credentials.user_id:
-            raise ClientError("invalid_input")
+            raise ClientError("invalid_argument")
         try:
             return self._transition(
                 credentials,
@@ -880,10 +885,15 @@ class _DeviceStore(_DeviceSessionStore):
                 expected_auth_generation=expected_auth_generation,
             )
         except ClientError as error:
-            if not self._location_ready or error.reason not in {
-                "device_storage_unavailable",
-                "device_storage_full",
-            }:
+            if (
+                not self._location_ready
+                or not error._storage_failure
+                or error.code
+                not in {
+                    "failed_precondition",
+                    "resource_exhausted",
+                }
+            ):
                 raise
         with self._locked():
             if (
@@ -928,7 +938,7 @@ class _DeviceStore(_DeviceSessionStore):
 
     def _begin_refresh(self, snapshot: SessionCredentials, generation: int) -> None:
         if self._volatile:
-            raise ClientError("device_storage_unavailable")
+            raise _storage_error("failed_precondition")
         with self._locked(), self._transaction() as record:
             state = self._read(record)
             if (
@@ -937,7 +947,7 @@ class _DeviceStore(_DeviceSessionStore):
                 or state["auth_unknown"]
             ):
                 self._load(state)
-                raise ClientError("invalid_session")
+                raise ClientError("failed_precondition")
             state["refresh_unknown"] = True
             self._write(record, state)
             self._load(state)
@@ -976,8 +986,8 @@ def _persist_settings(persist: bool | Mapping[str, object]) -> bool | dict[str, 
                 raise ValueError
             return {"dir": Path(os.path.abspath(raw))}
         except (OSError, ValueError, TypeError):
-            raise ClientError("device_storage_unavailable") from None
-    raise ClientError("invalid_input")
+            raise _storage_error("failed_precondition") from None
+    raise ClientError("invalid_argument")
 
 
 def _device_store(

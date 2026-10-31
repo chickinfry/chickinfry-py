@@ -1,6 +1,6 @@
 {
-  "generatorCommit": "fa9027165fda5c9fcb2ab34a99d798bd0b364420",
-  "command": "chik generate",
+  "generatorCommit": "ce7dd9249fc4102ed5f7c3fde18700841b047e92",
+  "command": "chik generate --yes",
   "declarations": "chik/",
   "generatedSource": "client/generated/python/src/chickinfry_client/"
 }

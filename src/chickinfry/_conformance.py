@@ -169,7 +169,7 @@ class _Observation:
                 and type(current) in (ClientError, OperationError)
                 and len(current.args) == 1
                 and type(current.args[0]) is str
-                and current.args == (_MESSAGES[current.reason],)
+                and current.args == (_MESSAGES.get(current._reason),)
             ):
                 fixed = False
                 visible.extend(
@@ -196,7 +196,7 @@ class _Observation:
                 fixed
                 and not getattr(error, "__notes__", ())
                 and isinstance(error, ClientError)
-                and self.refusal == getattr(error, "code", error.reason)
+                and self.refusal == error.code
             ):
                 return False
             return None

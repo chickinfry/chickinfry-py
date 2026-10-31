@@ -14,7 +14,7 @@ from typing import Protocol, cast
 
 import pytest
 
-from chickinfry import HTTP, AsyncHTTP
+from chickinfry import AsyncHttpTransport, HttpTransport
 from chickinfry._auth_database import Database, create_database
 from chickinfry.auth import Auth
 from chickinfry.errors import OperationError as ReceivedOperationError
@@ -701,7 +701,7 @@ class Guard(importlib.abc.MetaPathFinder):
         if fullname == "asyncpg" or fullname.startswith("chickinfry.server") or fullname.startswith("chickinfry.auth") or fullname.startswith("chickinfry.postgres"):
             raise AssertionError("Client imported server modules")
 sys.meta_path.insert(0, Guard())
-from chickinfry import HTTP, AsyncHTTP, SessionStore
+from chickinfry import HttpTransport, AsyncHttpTransport, MemoryStore
 assert "asyncpg" not in sys.modules
 """
     result = subprocess.run(
@@ -1035,12 +1035,12 @@ async def test_server_error_reaches_generated_client(mode: str) -> None:
     async with Peer(handler) as peer:
         with pytest.raises(ReceivedOperationError) as caught:
             if mode == "sync":
-                with HTTP(peer.origin) as transport:
+                with HttpTransport(peer.origin) as transport:
                     await asyncio.to_thread(
                         Client(transport).probe.echo, ProbeEchoInput(wire_value="ok")
                     )
             else:
-                async with AsyncHTTP(peer.origin) as transport_async:
+                async with AsyncHttpTransport(peer.origin) as transport_async:
                     await AsyncClient(transport_async).probe.echo(
                         ProbeEchoInput(wire_value="ok")
                     )

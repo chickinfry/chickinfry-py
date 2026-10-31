@@ -6,11 +6,11 @@ from dataclasses import asdict, replace
 import pytest
 
 from chickinfry import (
-    AsyncHTTP,
+    AsyncHttpTransport,
     ClientError,
+    MemoryStore,
     OperationError,
     SessionCredentials,
-    SessionStore,
 )
 
 from .peer import Peer, Received, json_bytes, respond
@@ -29,7 +29,7 @@ def credentials() -> SessionCredentials:
 
 def test_store_snapshot_generation_and_secret_repr() -> None:
     original = credentials()
-    store = SessionStore("HTTPS://example.com:443/", original)
+    store = MemoryStore("HTTPS://example.com:443/", original)
     old = store.credentials()
     assert old is not None
     assert bool(
@@ -45,11 +45,11 @@ def test_store_snapshot_generation_and_secret_repr() -> None:
     store.clear(new)
     assert store.credentials() is None
     with pytest.raises(
-        ClientError, check=lambda error: error.reason == "invalid_session"
+        ClientError, check=lambda error: error.code == "failed_precondition"
     ):
         store.replace(replace(original, access_token=original.access_token + "\n"))
     with pytest.raises(
-        ClientError, check=lambda error: error.reason == "invalid_session"
+        ClientError, check=lambda error: error.code == "failed_precondition"
     ):
         store.replace(replace(original, expires_at=""))
     assert store.credentials() is None
@@ -95,8 +95,8 @@ async def test_refresh_trigger_and_identical_original_bytes(
             payload["text"] = "changed after first send"
             await respond(writer, json_bytes({"error": code}), status=status)
 
-    async with Peer(handler) as peer, AsyncHTTP(peer.origin) as owner:
-        store = SessionStore(peer.origin, old)
+    async with Peer(handler) as peer, AsyncHttpTransport(peer.origin) as owner:
+        store = MemoryStore(peer.origin, old)
         with pytest.raises(OperationError) as caught:
             await owner.with_session(store).invoke(operation, payload)
         assert caught.value.status == status and caught.value.code == code
@@ -116,7 +116,7 @@ async def test_non_session_transport_does_not_refresh(mode: str) -> None:
     async def handler(request: Received, writer: asyncio.StreamWriter) -> None:
         await respond(writer, b'{"error":"invalid_token"}', status=401)
 
-    async with Peer(handler) as peer, AsyncHTTP(peer.origin) as owner:
+    async with Peer(handler) as peer, AsyncHttpTransport(peer.origin) as owner:
         transport = (
             owner
             if mode == "anonymous"
@@ -171,10 +171,10 @@ async def test_single_flight_across_owners_and_late_401(outcome: str) -> None:
 
     async with (
         Peer(handler) as peer,
-        AsyncHTTP(peer.origin, timeout=0.4) as left,
-        AsyncHTTP(peer.origin, timeout=0.4) as right,
+        AsyncHttpTransport(peer.origin, timeout=0.4) as left,
+        AsyncHttpTransport(peer.origin, timeout=0.4) as right,
     ):
-        store = SessionStore(peer.origin, old)
+        store = MemoryStore(peer.origin, old)
         copies = [left.with_session(store), right.with_session(store)]
 
         async def run(index: int) -> str:
@@ -186,7 +186,7 @@ async def test_single_flight_across_owners_and_late_401(outcome: str) -> None:
             except OperationError as failure:
                 return failure.code
             except ClientError as failure:
-                return failure.reason
+                return failure.code
             finally:
                 if index != 5:
                     release_late.set()
@@ -197,10 +197,10 @@ async def test_single_flight_across_owners_and_late_401(outcome: str) -> None:
         expected = {
             "success": "success",
             "rejected": "invalid_token",
-            "network": "network_error",
+            "network": "unavailable",
             "server": "operation_failed",
-            "malformed": "invalid_response",
-            "timeout": "timeout",
+            "malformed": "internal",
+            "timeout": "deadline_exceeded",
         }[outcome]
         assert results == [expected] * 6
         assert refresh_count == 1
@@ -243,10 +243,10 @@ async def test_cancelled_waiter_does_not_cancel_shared_refresh() -> None:
 
     async with (
         Peer(handler) as peer,
-        AsyncHTTP(peer.origin) as left,
-        AsyncHTTP(peer.origin) as right,
+        AsyncHttpTransport(peer.origin) as left,
+        AsyncHttpTransport(peer.origin) as right,
     ):
-        store = SessionStore(peer.origin, old)
+        store = MemoryStore(peer.origin, old)
         first = asyncio.create_task(left.with_session(store).invoke("thing.run", {}))
         second = asyncio.create_task(right.with_session(store).invoke("thing.run", {}))
         await asyncio.wait_for(started.wait(), 1)
@@ -293,8 +293,8 @@ async def test_late_refresh_does_not_overwrite_login_or_logout(
             )
             await respond(writer)
 
-    async with Peer(handler) as peer, AsyncHTTP(peer.origin) as owner:
-        store = SessionStore(peer.origin, old)
+    async with Peer(handler) as peer, AsyncHttpTransport(peer.origin) as owner:
+        store = MemoryStore(peer.origin, old)
         first_snapshot = store.credentials()
         assert first_snapshot is not None
         task = asyncio.create_task(
@@ -348,11 +348,11 @@ async def test_refresh_all_required_fields_and_credentials_preserved(
         else:
             await respond(writer, b'{"error":"invalid_token"}', status=401)
 
-    async with Peer(handler) as peer, AsyncHTTP(peer.origin) as owner:
-        store = SessionStore(peer.origin, old)
+    async with Peer(handler) as peer, AsyncHttpTransport(peer.origin) as owner:
+        store = MemoryStore(peer.origin, old)
         snapshot = store.credentials()
         with pytest.raises(
-            ClientError, check=lambda error: error.reason == "invalid_response"
+            ClientError, check=lambda error: error.code == "internal"
         ) as caught:
             await owner.with_session(store).invoke("thing.run", {})
         assert caught.value.status == 200
@@ -384,8 +384,8 @@ async def test_changed_snapshot_before_401_uses_latest_without_refresh(
             )
             await respond(writer)
 
-    async with Peer(handler) as peer, AsyncHTTP(peer.origin) as owner:
-        store = SessionStore(peer.origin, old)
+    async with Peer(handler) as peer, AsyncHttpTransport(peer.origin) as owner:
+        store = MemoryStore(peer.origin, old)
         task = asyncio.create_task(owner.with_session(store).invoke("thing.run", {}))
         await asyncio.wait_for(started.wait(), 1)
         if previous_flight != "none":
@@ -427,16 +427,18 @@ async def test_total_deadline_limits_wait_for_other_owners_refresh() -> None:
 
     async with (
         Peer(handler) as peer,
-        AsyncHTTP(peer.origin, timeout=1) as slow,
-        AsyncHTTP(peer.origin, timeout=0.05) as fast,
+        AsyncHttpTransport(peer.origin, timeout=1) as slow,
+        AsyncHttpTransport(peer.origin, timeout=0.05) as fast,
     ):
-        store = SessionStore(peer.origin, old)
+        store = MemoryStore(peer.origin, old)
         slow_task = asyncio.create_task(
             slow.with_session(store).invoke("thing.run", {})
         )
         await asyncio.wait_for(started.wait(), 1)
         begin = asyncio.get_running_loop().time()
-        with pytest.raises(ClientError, check=lambda error: error.reason == "timeout"):
+        with pytest.raises(
+            ClientError, check=lambda error: error.code == "deadline_exceeded"
+        ):
             await fast.with_session(store).invoke("thing.run", {})
         assert asyncio.get_running_loop().time() - begin < 0.4
         release.set()
@@ -464,8 +466,8 @@ async def test_orphaned_refresh_failure_is_consumed_and_reclaimed() -> None:
         await respond(writer, b'{"error":"invalid_token"}', status=401)
 
     try:
-        async with Peer(handler) as peer, AsyncHTTP(peer.origin) as owner:
-            store = SessionStore(peer.origin, old)
+        async with Peer(handler) as peer, AsyncHttpTransport(peer.origin) as owner:
+            store = MemoryStore(peer.origin, old)
             task = asyncio.create_task(
                 owner.with_session(store).invoke("thing.run", {})
             )

@@ -16,12 +16,12 @@ import pytest
 from typing_extensions import Buffer
 
 from chickinfry import (
-    HTTP,
-    AsyncHTTP,
+    AsyncHttpTransport,
     ClientError,
+    HttpTransport,
+    MemoryStore,
     OperationError,
     SessionCredentials,
-    SessionStore,
     _sync_network,
 )
 from chickinfry._http_common import _response, _serialize
@@ -35,22 +35,22 @@ from .test_session import credentials
 @asynccontextmanager
 async def _owner(
     mode: str, origin: str, timeout: float = 1.0
-) -> AsyncIterator[HTTP | AsyncHTTP]:
+) -> AsyncIterator[HttpTransport | AsyncHttpTransport]:
     if mode == "async":
-        async with AsyncHTTP(origin, timeout=timeout) as owner:
+        async with AsyncHttpTransport(origin, timeout=timeout) as owner:
             yield owner
     else:
-        with HTTP(origin, timeout=timeout) as sync:
+        with HttpTransport(origin, timeout=timeout) as sync:
             yield sync
 
 
 async def _call(
-    owner: HTTP | AsyncHTTP,
+    owner: HttpTransport | AsyncHttpTransport,
     operation: str = "thing.run",
     payload: bytes | Mapping[str, object] = b"{}",
-    store: SessionStore | None = None,
+    store: MemoryStore | None = None,
 ) -> object:
-    if isinstance(owner, AsyncHTTP):
+    if isinstance(owner, AsyncHttpTransport):
         client = owner.with_session(store) if store is not None else owner
         return await client.invoke(operation, payload)
     sync = owner.with_session(store) if store is not None else owner
@@ -118,7 +118,7 @@ async def test_environment_ca_is_not_trusted(
         )
         async with _owner(mode, origin) as owner:
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "network_error"
+                ClientError, check=lambda error: error.code == "unavailable"
             ):
                 await _call(owner)
         assert not peer.received
@@ -159,8 +159,8 @@ async def test_interrupt_during_start_keeps_live_refresh_owned(
             raise KeyboardInterrupt
 
     async with Peer(handler) as peer:
-        with HTTP(peer.origin) as owner:
-            store = SessionStore(peer.origin, old)
+        with HttpTransport(peer.origin) as owner:
+            store = MemoryStore(peer.origin, old)
             client = owner.with_session(store)
             monkeypatch.setattr(threading.Thread, "start", interrupted)
 
@@ -250,10 +250,10 @@ async def test_async_absolute_deadlines_discard_late_success(
             await respond(writer)
 
     async with Peer(handler) as peer:
-        owner = AsyncHTTP(peer.origin, timeout=0.02)
+        owner = AsyncHttpTransport(peer.origin, timeout=0.02)
         if phase != "setup":
             owner._http_client()
-        store = SessionStore(peer.origin, old)
+        store = MemoryStore(peer.origin, old)
         snapshot = store.credentials()
         import chickinfry.http as implementation
 
@@ -314,7 +314,7 @@ async def test_async_absolute_deadlines_discard_late_success(
             monkeypatch.setattr(owner, "_attempt", publish_late)
         try:
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "timeout"
+                ClientError, check=lambda error: error.code == "deadline_exceeded"
             ):
                 await _call(
                     owner, store=store if phase in {"credentials", "publish"} else None
@@ -349,10 +349,10 @@ async def test_invalid_error_envelope_preserves_status(mode: str, body: bytes) -
 
     async with Peer(handler) as peer:
         async with _owner(mode, peer.origin) as owner:
-            with pytest.raises(OperationError) as caught:
+            with pytest.raises(ClientError) as caught:
                 await _call(owner)
-        assert caught.value.code == "invalid_response" and caught.value.status == 503
-        assert not caught.value._valid_error_envelope
+        assert caught.value.code == "internal" and caught.value.status == 503
+        assert not isinstance(caught.value, OperationError)
         assert len(peer.received) == 1
 
 
@@ -406,7 +406,7 @@ async def test_unknown_refresh_blocks_generation_until_replace(
 
     async with Peer(handler) as peer:
         async with _owner(mode, peer.origin, timeout=0.5) as owner:
-            store = SessionStore(peer.origin, old)
+            store = MemoryStore(peer.origin, old)
             snapshot = store.credentials()
             with pytest.raises(ClientError) as first:
                 await _call(owner, store=store)
@@ -439,8 +439,8 @@ async def test_uncertain_unstarted_producer_expires_without_second_refresh(
         start(thread)
 
     async with Peer(handler) as peer:
-        with HTTP(peer.origin, timeout=0.04) as owner:
-            store = SessionStore(peer.origin, old)
+        with HttpTransport(peer.origin, timeout=0.04) as owner:
+            store = MemoryStore(peer.origin, old)
             client = owner.with_session(store)
             monkeypatch.setattr(threading.Thread, "start", unknown)
 
@@ -453,7 +453,7 @@ async def test_uncertain_unstarted_producer_expires_without_second_refresh(
 
             assert await asyncio.to_thread(interrupted)
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "timeout"
+                ClientError, check=lambda error: error.code == "deadline_exceeded"
             ):
                 await asyncio.to_thread(client.invoke, "thing.run", {})
             await asyncio.sleep(0.01)
@@ -493,12 +493,12 @@ async def test_definite_creation_failure_can_retry_new_call(
         start(thread)
 
     async with Peer(handler) as peer:
-        with HTTP(peer.origin) as owner:
-            store = SessionStore(peer.origin, old)
+        with HttpTransport(peer.origin) as owner:
+            store = MemoryStore(peer.origin, old)
             client = owner.with_session(store)
             monkeypatch.setattr(threading.Thread, "start", fail)
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "network_error"
+                ClientError, check=lambda error: error.code == "unavailable"
             ):
                 await asyncio.to_thread(client.invoke, "thing.run", {})
             assert not store._sync_flights and store._blocked_generation is None
@@ -554,16 +554,26 @@ def test_package_does_not_export_private_conformance_hooks() -> None:
     from chickinfry import _conformance
 
     assert set(chickinfry.__all__) == {
-        "HTTP",
-        "SyncClientTransport",
-        "AsyncHTTP",
-        "ClientTransport",
+        "HttpTransport",
+        "Transport",
+        "AsyncHttpTransport",
+        "AsyncTransport",
         "ClientError",
         "OperationError",
         "FieldError",
         "SessionCredentials",
-        "SessionStore",
+        "MemoryStore",
     }
+    for name in chickinfry.__all__:
+        assert getattr(chickinfry, name).__name__ == name
+    for name in (
+        "HTTP",
+        "AsyncHTTP",
+        "ClientTransport",
+        "SyncClientTransport",
+        "SessionStore",
+    ):
+        assert not hasattr(chickinfry, name)
     private = {
         "_observer",
         "_Observation",
@@ -599,13 +609,18 @@ def test_sync_read_phase_cannot_outlive_remaining_whole_deadline(
             sync_clock.advance(remaining)
             raise TimeoutError
 
-    with ObservedSocket() as sock, HTTP("http://127.0.0.1", timeout=10.0) as owner:
+    with (
+        ObservedSocket() as sock,
+        HttpTransport("http://127.0.0.1", timeout=10.0) as owner,
+    ):
         monkeypatch.setattr(
             _sync_network._Backend,
             "connect_tcp",
             lambda backend, *args, **kwargs: _sync_network._Stream(sock, backend),
         )
-        with pytest.raises(ClientError, check=lambda error: error.reason == "timeout"):
+        with pytest.raises(
+            ClientError, check=lambda error: error.code == "deadline_exceeded"
+        ):
             owner._attempt("thing.run", b"{}", None, 0.20)
         assert timeouts == pytest.approx([0.10])
         assert sync_clock.now == pytest.approx(0.20)
@@ -638,9 +653,9 @@ async def test_incomplete_body_failure_is_outcome_unknown(
 
     async with Peer(handler) as peer:
         async with _owner(mode, peer.origin) as owner:
-            reason = "response_too_large" if failure == "size" else "invalid_response"
+            reason = "resource_exhausted" if failure == "size" else "internal"
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == reason
+                ClientError, check=lambda error: error.code == reason
             ) as caught:
                 await _call(owner)
             assert caught.value.status == 200 and caught.value._outcome_unknown
@@ -664,7 +679,7 @@ async def test_well_formed_refresh_401_clears_only_expected_without_retry(
 
     async with Peer(handler) as peer:
         async with _owner(mode, peer.origin) as owner:
-            store = SessionStore(peer.origin, credentials())
+            store = MemoryStore(peer.origin, credentials())
             with pytest.raises(OperationError) as caught:
                 await _call(owner, store=store)
             assert caught.value.code == code and caught.value._valid_error_envelope
@@ -709,7 +724,7 @@ async def test_refresh_hooks_preserve_unregistered_session_behavior(
                 )
 
         async with Peer(handler) as peer, _owner(mode, peer.origin) as owner:
-            store = SessionStore(peer.origin, credentials())
+            store = MemoryStore(peer.origin, credentials())
             observation = _Observation(float("inf")) if registered else None
             token = _observer.set(observation) if observation is not None else None
             try:

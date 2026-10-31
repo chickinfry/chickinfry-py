@@ -10,7 +10,13 @@ from typing import TypeVar, cast
 import httpx
 import pytest
 
-from chickinfry import HTTP, AsyncHTTP, ClientError, OperationError, SessionStore
+from chickinfry import (
+    AsyncHttpTransport,
+    ClientError,
+    HttpTransport,
+    MemoryStore,
+    OperationError,
+)
 
 from .deadline import Clock
 from .peer import Peer, Received, json_bytes, respond
@@ -50,8 +56,8 @@ async def test_sync_refresh_only_once_and_first_bytes(
             await respond(writer, json_bytes({"error": code}), status=status)
 
     async with Peer(handler) as peer:
-        with HTTP(peer.origin) as owner:
-            store = SessionStore(peer.origin, old)
+        with HttpTransport(peer.origin) as owner:
+            store = MemoryStore(peer.origin, old)
             with pytest.raises(OperationError) as caught:
                 await asyncio.to_thread(
                     owner.with_session(store).invoke, operation, body
@@ -110,10 +116,10 @@ async def test_sync_threads_share_one_result_including_late_401(
     loop = asyncio.get_running_loop()
     async with Peer(handler) as peer:
         with (
-            HTTP(peer.origin, timeout=0.4) as left,
-            HTTP(peer.origin, timeout=0.4) as right,
+            HttpTransport(peer.origin, timeout=0.4) as left,
+            HttpTransport(peer.origin, timeout=0.4) as right,
         ):
-            store = SessionStore(peer.origin, old)
+            store = MemoryStore(peer.origin, old)
             snapshot = store.credentials()
             copies = [left.with_session(store), right.with_session(store)]
             barrier = threading.Barrier(6)
@@ -139,16 +145,13 @@ async def test_sync_threads_share_one_result_including_late_401(
             expected = {
                 "success": None,
                 "rejected": "invalid_token",
-                "network": "network_error",
+                "network": "unavailable",
                 "server": "operation_failed",
-                "malformed": "invalid_response",
-                "timeout": "timeout",
+                "malformed": "internal",
+                "timeout": "deadline_exceeded",
             }[outcome]
             assert [
-                (error.code if isinstance(error, OperationError) else error.reason)
-                if error is not None
-                else None
-                for error in results
+                (error.code) if error is not None else None for error in results
             ] == [expected] * 6
             if outcome != "success":
                 assert len({id(error) for error in results}) == 6
@@ -213,8 +216,8 @@ async def test_sync_other_thread_login_logout_preserves_generation(
             await respond(writer)
 
     async with Peer(handler) as peer:
-        with HTTP(peer.origin) as owner:
-            store = SessionStore(peer.origin, old)
+        with HttpTransport(peer.origin) as owner:
+            store = MemoryStore(peer.origin, old)
             signed = owner.with_session(store)
             original = store.credentials()
             assert original is not None
@@ -264,14 +267,14 @@ async def test_sync_short_waiter_fixed_deadline_does_not_cancel_producer(
         return httpx.Response(200, stream=httpx.ByteStream(b"{}"))
 
     with (
-        HTTP("http://127.0.0.1", timeout=1) as leader,
-        HTTP("http://127.0.0.1", timeout=0.06) as short,
+        HttpTransport("http://127.0.0.1", timeout=1) as leader,
+        HttpTransport("http://127.0.0.1", timeout=0.06) as short,
     ):
         for owner in (leader, short):
             assert owner._client is not None
             owner._client.close()
             owner._client = httpx.Client(transport=httpx.MockTransport(handler))
-        store = SessionStore("http://127.0.0.1", old)
+        store = MemoryStore("http://127.0.0.1", old)
         snapshot = store.credentials()
         first = asyncio.create_task(
             asyncio.to_thread(leader.with_session(store).invoke, "thing.run", {})
@@ -299,7 +302,7 @@ async def test_sync_short_waiter_fixed_deadline_does_not_cancel_producer(
             assert await asyncio.to_thread(started.wait, 5)
             monkeypatch.setattr(store._condition, "wait", wake)
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "timeout"
+                ClientError, check=lambda error: error.code == "deadline_exceeded"
             ):
                 await asyncio.to_thread(invoke)
             assert waits == pytest.approx([0.18, 0.12, 0.06])
@@ -336,8 +339,8 @@ async def test_sync_keyboard_interrupt_waiter_leaves_other_waiter_running(
             await respond(writer)
 
     async with Peer(handler) as peer:
-        with HTTP(peer.origin) as owner:
-            store = SessionStore(peer.origin, old)
+        with HttpTransport(peer.origin) as owner:
+            store = MemoryStore(peer.origin, old)
             signed = owner.with_session(store)
             first = asyncio.create_task(
                 asyncio.to_thread(signed.invoke, "thing.run", {})
@@ -376,8 +379,8 @@ async def test_sync_producer_failure_wakes_and_preserves_credentials(
         await respond(writer, b'{"error":"invalid_token"}', status=401)
 
     async with Peer(handler) as peer:
-        with HTTP(peer.origin) as owner:
-            store = SessionStore(peer.origin, old)
+        with HttpTransport(peer.origin) as owner:
+            store = MemoryStore(peer.origin, old)
             signed = owner.with_session(store)
             original_snapshot = store.credentials()
             original_start = threading.Thread.start
@@ -437,7 +440,7 @@ async def test_sync_producer_failure_wakes_and_preserves_credentials(
                 return None
 
             result = await asyncio.to_thread(call)
-            assert result is not None and result.reason == "network_error"
+            assert result is not None and result.code == "unavailable"
             assert bool(
                 old.access_token not in repr(result)
                 and old.refresh_token not in repr(result)
@@ -459,8 +462,8 @@ async def test_store_mode_never_changes_after_clear_replace_or_close(
         await respond(writer)
 
     async with Peer(handler) as peer:
-        store = SessionStore(peer.origin, credentials())
-        sync, asynchronous = HTTP(peer.origin), AsyncHTTP(peer.origin)
+        store = MemoryStore(peer.origin, credentials())
+        sync, asynchronous = HttpTransport(peer.origin), AsyncHttpTransport(peer.origin)
         if first_mode == "sync":
             sync.with_session(store)
         else:
@@ -471,10 +474,10 @@ async def test_store_mode_never_changes_after_clear_replace_or_close(
         store.replace(credentials())
         sync.close()
         await asynchronous.aclose()
-        with HTTP(peer.origin) as next_sync:
-            async with AsyncHTTP(peer.origin) as next_async:
+        with HttpTransport(peer.origin) as next_sync:
+            async with AsyncHttpTransport(peer.origin) as next_async:
                 with pytest.raises(
-                    ClientError, check=lambda error: error.reason == "invalid_session"
+                    ClientError, check=lambda error: error.code == "failed_precondition"
                 ):
                     if first_mode == "sync":
                         next_async.with_session(store)
@@ -488,8 +491,8 @@ async def test_store_mode_attachment_is_atomic_between_threads() -> None:
         await respond(writer)
 
     async with Peer(handler) as peer:
-        store = await asyncio.to_thread(SessionStore, peer.origin, credentials())
-        sync, asynchronous = HTTP(peer.origin), AsyncHTTP(peer.origin)
+        store = await asyncio.to_thread(MemoryStore, peer.origin, credentials())
+        sync, asynchronous = HttpTransport(peer.origin), AsyncHttpTransport(peer.origin)
         barrier = threading.Barrier(2)
 
         def attach(mode: str) -> str:
@@ -501,14 +504,14 @@ async def test_store_mode_attachment_is_atomic_between_threads() -> None:
                     asynchronous.with_session(store)
                 return mode
             except ClientError as failure:
-                return failure.reason
+                return failure.code
 
         def run() -> list[str]:
             with ThreadPoolExecutor(max_workers=2) as executor:
                 return list(executor.map(attach, ["sync", "async"]))
 
         outcomes = await asyncio.to_thread(run)
-        assert outcomes.count("invalid_session") == 1
+        assert outcomes.count("failed_precondition") == 1
         assert sum(value in {"sync", "async"} for value in outcomes) == 1
         assert not peer.received
         sync.close()
@@ -532,11 +535,11 @@ async def test_sync_expired_flight_retains_producer_and_discards_late_success(
             401, stream=httpx.ByteStream(b'{"error":"invalid_token"}')
         )
 
-    with HTTP("http://127.0.0.1", timeout=0.20) as owner:
+    with HttpTransport("http://127.0.0.1", timeout=0.20) as owner:
         assert owner._client is not None
         owner._client.close()
         owner._client = httpx.Client(transport=httpx.MockTransport(handler))
-        store = SessionStore("http://127.0.0.1", old)
+        store = MemoryStore("http://127.0.0.1", old)
         snapshot = store.credentials()
         signed = owner.with_session(store)
         original = owner._attempt
@@ -573,7 +576,7 @@ async def test_sync_expired_flight_retains_producer_and_discards_late_success(
         call = asyncio.create_task(asyncio.to_thread(signed.invoke, "thing.run", {}))
         try:
             with pytest.raises(
-                ClientError, check=lambda error: error.reason == "timeout"
+                ClientError, check=lambda error: error.code == "deadline_exceeded"
             ):
                 await asyncio.wait_for(call, 5)
             assert waits == pytest.approx([0.20, 0.15, 0.10, 0.05])
@@ -618,8 +621,8 @@ async def test_sync_new_login_before_late_401_skips_old_refresh(
             await respond(writer)
 
     async with Peer(handler) as peer:
-        with HTTP(peer.origin) as owner:
-            store = SessionStore(peer.origin, old)
+        with HttpTransport(peer.origin) as owner:
+            store = MemoryStore(peer.origin, old)
             signed = owner.with_session(store)
             call = asyncio.create_task(
                 asyncio.to_thread(signed.invoke, "thing.late", {})
@@ -644,24 +647,22 @@ async def test_failed_attachment_does_not_pin_mode(invalid: str) -> None:
         await respond(writer)
 
     async with Peer(handler) as peer:
-        store = SessionStore(
-            peer.origin, credentials() if invalid == "origin" else None
-        )
-        with HTTP(peer.origin) as sync:
+        store = MemoryStore(peer.origin, credentials() if invalid == "origin" else None)
+        with HttpTransport(peer.origin) as sync:
             if invalid == "origin":
                 with pytest.raises(
-                    ClientError, check=lambda error: error.reason == "origin_mismatch"
+                    ClientError, check=lambda error: error.code == "failed_precondition"
                 ):
-                    AsyncHTTP("https://example.com").with_session(store)
+                    AsyncHttpTransport("https://example.com").with_session(store)
                 sync.with_session(store)
                 assert store._mode == "sync"
             else:
                 with pytest.raises(
-                    ClientError, check=lambda error: error.reason == "invalid_session"
+                    ClientError, check=lambda error: error.code == "unauthenticated"
                 ):
                     sync.with_session(store)
                 store.replace(credentials())
-                asynchronous = AsyncHTTP(peer.origin)
+                asynchronous = AsyncHttpTransport(peer.origin)
                 asynchronous.with_session(store)
                 assert store._mode == "async"
                 await asynchronous.aclose()
@@ -680,8 +681,8 @@ async def test_async_refresh_task_factory_runs_outside_store_lock() -> None:
             await respond(writer)
 
     async with Peer(handler) as peer:
-        async with AsyncHTTP(peer.origin) as owner:
-            store = SessionStore(peer.origin, old)
+        async with AsyncHttpTransport(peer.origin) as owner:
+            store = MemoryStore(peer.origin, old)
             signed = owner.with_session(store)
             available: list[bool] = []
             loop = asyncio.get_running_loop()

@@ -12,7 +12,7 @@ import httpcore
 import httpx
 
 from ._conformance import _observer
-from .errors import ClientError
+from .errors import _local_error
 
 _deadline: ContextVar[float] = ContextVar("chickinfry_sync_deadline")
 SocketOption = (
@@ -248,7 +248,7 @@ class _Transport(httpx.BaseTransport):
             _remaining()
             with self._lock:
                 if self._closed:
-                    raise ClientError("transport_closed")
+                    raise _local_error("failed_precondition", "transport_closed")
             core_request = httpcore.Request(
                 method=request.method,
                 url=httpcore.URL(

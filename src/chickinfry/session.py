@@ -10,7 +10,7 @@ from typing import Literal, Protocol, cast, runtime_checkable
 from ._conformance import _ClearAttempt, _HookError, _observer
 from ._origin import canonical_origin
 from ._request_state import _RequestState
-from .errors import ClientError, FieldError, OperationError
+from .errors import ClientError, FieldError, OperationError, _local_error
 from .wire import read_record, read_string
 
 
@@ -47,7 +47,7 @@ def _validate(credentials: SessionCredentials) -> None:
             )
         )
     ):
-        raise ClientError("invalid_session")
+        raise ClientError("failed_precondition")
 
 
 def _read_credentials(value: object) -> SessionCredentials:
@@ -65,29 +65,33 @@ def _read_credentials(value: object) -> SessionCredentials:
         return credentials
     except ClientError:
         pass
-    raise ClientError("invalid_response")
+    raise ClientError("internal")
 
 
 @dataclass(frozen=True, slots=True)
 class _Failure:
-    reason: str
+    code: str
     status: int | None = None
-    code: str | None = None
+    operation: bool = False
     valid_error_envelope: bool = False
     retryable: bool = False
     outcome_unknown: bool = False
     hook_failed: bool = False
+    storage_failure: bool = False
+    reason: str | None = field(default=None, repr=False)
     response_message: str | None = field(default=None, repr=False)
     fields: tuple[FieldError, ...] = field(default=(), repr=False)
 
     @classmethod
     def from_error(cls, error: ClientError) -> "_Failure":
         return cls(
-            error.reason,
+            error.code,
             error.status,
-            error.code if isinstance(error, OperationError) else None,
+            isinstance(error, OperationError),
             error._valid_error_envelope if isinstance(error, OperationError) else False,
             outcome_unknown=error._outcome_unknown,
+            storage_failure=error._storage_failure,
+            reason=error._reason,
             response_message=error.response_message
             if isinstance(error, OperationError)
             else None,
@@ -98,13 +102,14 @@ class _Failure:
         if self.hook_failed:
             raise _HookError()
         error: ClientError
-        if self.code is not None and self.status is not None:
+        if self.operation and self.status is not None:
             error = OperationError(
                 self.code, self.status, self.response_message, self.fields
             )
             error._valid_error_envelope = self.valid_error_envelope
         else:
-            error = ClientError(self.reason, self.status)
+            error = _local_error(self.code, self.reason or self.code, self.status)
+            error._storage_failure = self.storage_failure
         error._outcome_unknown = self.outcome_unknown
         return error
 
@@ -204,7 +209,7 @@ def _commit_device_refresh(
                 or state["session"] != asdict(previous)
                 or state["auth_unknown"]
             ):
-                raise ClientError("invalid_session")
+                raise ClientError("failed_precondition")
             if store._accept_login(
                 credentials,
                 user_id=credentials.user_id,
@@ -218,12 +223,15 @@ def _commit_device_refresh(
             or state["session"] != asdict(previous)
             or state["auth_unknown"]
         ):
-            raise ClientError("invalid_session")
+            raise ClientError("failed_precondition")
     except ClientError as error:
-        if error.reason not in {"device_storage_unavailable", "device_storage_full"}:
+        if not error._storage_failure or error.code not in {
+            "failed_precondition",
+            "resource_exhausted",
+        }:
             raise
     if store._auth_generation != auth_generation or store._credentials != previous:
-        raise ClientError("invalid_session")
+        raise ClientError("failed_precondition")
     store._keep_memory(
         credentials,
         persisted_auth_generation=auth_generation,
@@ -231,7 +239,7 @@ def _commit_device_refresh(
     )
 
 
-class SessionStore:
+class MemoryStore:
     """An origin-bound store fixed to sync threads or one asyncio loop on attachment."""
 
     def __init__(
@@ -258,10 +266,10 @@ class SessionStore:
         else:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not self._condition.acquire(timeout=remaining):
-                raise ClientError("timeout")
+                raise ClientError("deadline_exceeded")
         try:
             if deadline is not None and time.monotonic() >= deadline:
-                raise ClientError("timeout")
+                raise ClientError("deadline_exceeded")
             yield
         finally:
             self._condition.release()
@@ -274,18 +282,18 @@ class SessionStore:
         except RuntimeError:
             loop = None
         if self._loop is not None and loop is not self._loop:
-            raise ClientError("wrong_event_loop")
+            raise _local_error("failed_precondition", "wrong_event_loop")
         if loop is not None:
             self._loop = loop
 
     def _attach(self, mode: Literal["sync", "async"], origin: str) -> None:
         with self._locked():
             if origin != self._origin:
-                raise ClientError("origin_mismatch")
+                raise _local_error("failed_precondition", "origin_mismatch")
             if self._mode is not None and self._mode != mode:
-                raise ClientError("invalid_session")
+                raise ClientError("failed_precondition")
             if self._credentials is None:
-                raise ClientError("invalid_session")
+                raise _local_error("unauthenticated", "invalid_session")
             _validate(self._credentials)
             if mode == "async":
                 self._check_loop()
@@ -328,7 +336,7 @@ class SessionStore:
             self._check_loop()
             snapshot = self._credentials
             if snapshot is None:
-                raise ClientError("invalid_session")
+                raise _local_error("unauthenticated", "invalid_session")
             _validate(snapshot)
             generation = self._generation
             self._active[generation] = self._active.get(generation, 0) + 1
