@@ -8,6 +8,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator, cast
@@ -47,7 +48,7 @@ def attempt() -> dict[str, object]:
     return {
         "attempt": "opaque-attempt",
         "email": "person@example.invalid",
-        "started_at": "2026-10-18T07:00:00Z",
+        "started_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
         "sequence": 1,
     }
 

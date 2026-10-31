@@ -4,9 +4,11 @@ import json
 import os
 import stat
 import sys
+import threading
 from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, dataclass, replace
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -77,6 +79,7 @@ def _next_auth_generation(
     credentials: SessionCredentials | None,
     *,
     scoped_delete: bool = False,
+    floor: int = 0,
 ) -> int:
     generation = cast(int, state["auth_generation"])
     previous = state["session"]
@@ -86,7 +89,7 @@ def _next_auth_generation(
             credentials.session_id,
         ):
             return generation
-    return generation + 1
+    return max(generation, floor) + 1
 
 
 def _location(app: str) -> Path:
@@ -327,19 +330,28 @@ def _atomic_write(path: Path, data: bytes, *, directory: int | None = None) -> N
 class _Record:
     raw: bytes | None
     directory: int | None = None
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
 
 class _DeviceSessionStore(MemoryStore):
     def __init__(self, origin: str) -> None:
         super().__init__(origin)
         self._auth_generation = 0
+        self._peer_blocked = False
         self._call_auth_generations: dict[int, int] = {}
 
     def _register(
         self, deadline: float | None = None
     ) -> tuple[SessionCredentials, int]:
         with self._locked(deadline):
+            previous_auth = self._auth_generation
+            had_credentials = self._credentials is not None
             self.credentials()
+            if had_credentials and previous_auth != self._auth_generation:
+                self._credentials = None
+                raise _local_error("unauthenticated", "invalid_session")
+            if self._peer_blocked:
+                raise _local_error("unauthenticated", "invalid_session")
             snapshot, generation = super()._register(deadline)
             self._call_auth_generations[generation] = self._auth_generation
             return snapshot, generation
@@ -396,6 +408,16 @@ class _DeviceStore(_DeviceSessionStore):
         self._refresh_auth_generations: dict[int, int] = {}
         self._auth_in_progress: tuple[int, object] | None = None
         self._retired_screens: set[str] = set()
+        self._baseline: dict[str, object] | None = None
+        self._pending: dict[str, object] | None = None
+        self._candidate: dict[str, object] | None = None
+        self._pending_view: dict[str, object] | None = None
+        self._discarded = False
+        self._peer_blocked = False
+        self._auth_request: str | None = None
+        self._refresh_request: str | None = None
+        self._memory_success = False
+        self._auth_high_water = 0
 
     @contextmanager
     def _transaction(self, *, block_on_failure: bool = False) -> Iterator[_Record]:
@@ -408,7 +430,8 @@ class _DeviceStore(_DeviceSessionStore):
         try:
             if self._memory_record is not None:
                 self._location_ready = True
-                yield self._memory_record
+                with self._memory_record.lock:
+                    yield self._memory_record
                 return
             self._directory = self._directory or _location(self._app)
             if _HOST == "win32":
@@ -464,6 +487,8 @@ class _DeviceStore(_DeviceSessionStore):
                 "attempts": {},
                 "refresh_unknown": False,
                 "auth_unknown": False,
+                "refresh_request": None,
+                "auth_request": None,
             }
         try:
             if len(record.raw) > _MAX_BYTES:
@@ -479,6 +504,8 @@ class _DeviceStore(_DeviceSessionStore):
             if state["version"] != _VERSION:
                 raise _storage_error("unimplemented")
             state.setdefault("auth_unknown", False)
+            state.setdefault("refresh_request", None)
+            state.setdefault("auth_request", None)
             if (
                 set(state)
                 != {
@@ -490,6 +517,8 @@ class _DeviceStore(_DeviceSessionStore):
                     "attempts",
                     "refresh_unknown",
                     "auth_unknown",
+                    "refresh_request",
+                    "auth_request",
                 }
                 or state["scope"] != self._scope
                 or type(state["generation"]) is not int
@@ -501,6 +530,15 @@ class _DeviceStore(_DeviceSessionStore):
                 or not isinstance(state["attempts"], dict)
             ):
                 raise ValueError
+            for kind in ("refresh", "auth"):
+                request = state[kind + "_request"]
+                if request is not None and (
+                    not isinstance(request, str)
+                    or not 0 < len(request) <= _MAX_SCREEN
+                    or not request.isascii()
+                    or not state[kind + "_unknown"]
+                ):
+                    raise ValueError
             if (state["refresh_unknown"] or state["auth_unknown"]) and state[
                 "session"
             ] is None:
@@ -548,37 +586,235 @@ class _DeviceStore(_DeviceSessionStore):
             state["auth_generation"],
             state["session"],
         )
-        if generation != self._generation or self._credentials is None:
-            credentials = (
-                _read_credentials(state["session"])
-                if state["session"] is not None and not unknown_auth
-                else None
-            )
-            # Attempt-only changes must preserve a pending delete's expected session.
-            if (
-                state["auth_generation"] != self._auth_generation
-                or credentials != self._credentials
-            ):
-                self._credentials = credentials
-        if unknown_auth:
-            self._credentials = None
+        credentials = (
+            _read_credentials(state["session"])
+            if state["session"] is not None and not unknown_auth
+            else None
+        )
+        # Attempt-only changes must preserve a pending delete's expected session.
+        if (
+            state["auth_generation"] != self._auth_generation
+            or credentials != self._credentials
+        ):
+            self._credentials = credentials
         self._generation = generation
         self._auth_generation = cast(int, state["auth_generation"])
+        self._auth_high_water = max(self._auth_high_water, self._auth_generation)
         self._blocked_generation = (
             generation if state["refresh_unknown"] or state["auth_unknown"] else None
         )
+        if not state["refresh_unknown"] and not state["auth_unknown"]:
+            self._peer_blocked = False
+        if not self._volatile:
+            self._baseline = deepcopy(state)
+
+    def _commit(self, record: _Record, state: dict[str, object]) -> None:
+        self._candidate = deepcopy(state)
+        self._write(record, state)
+        self._candidate = None
+
+    def _hold(self, state: dict[str, object]) -> None:
+        self._pending = deepcopy(state)
+        self._pending_view = None
+        self._volatile = True
+        if self._baseline is not None:
+            self._persisted_auth_generation = cast(
+                int, self._baseline["auth_generation"]
+            )
+            self._persisted_session = deepcopy(self._baseline["session"])
+        self._load(state)
+
+    @staticmethod
+    def _recoverable(error: ClientError) -> bool:
+        return error._storage_failure and error.code in {
+            "failed_precondition",
+            "resource_exhausted",
+        }
+
+    @staticmethod
+    def _auth_state(state: dict[str, object]) -> tuple[object, ...]:
+        return tuple(
+            state[key]
+            for key in (
+                "scope",
+                "auth_generation",
+                "session",
+                "refresh_unknown",
+                "refresh_request",
+                "auth_unknown",
+                "auth_request",
+            )
+        )
+
+    def _merge_attempts(
+        self,
+        base: dict[str, object],
+        memory: dict[str, object],
+        latest: dict[str, object],
+    ) -> dict[str, object]:
+        before = cast(dict[str, dict[str, object]], base["attempts"])
+        local = cast(dict[str, dict[str, object]], memory["attempts"])
+        remote = cast(dict[str, dict[str, object]], latest["attempts"])
+        merged = deepcopy(remote)
+        for screen, old in before.items():
+            own = local.get(screen)
+            current = merged.get(screen)
+            if (own is None or own["attempt"] != old["attempt"]) and (
+                current is not None and current["attempt"] == old["attempt"]
+            ):
+                merged.pop(screen)
+        for screen, own in local.items():
+            original = before.get(screen)
+            current = remote.get(screen)
+            if original is not None and own["attempt"] == original["attempt"]:
+                if current is None or current["attempt"] != original["attempt"]:
+                    continue
+                if own == original:
+                    continue
+            if (
+                current is not None
+                and current != original
+                and (cast(int, own["sequence"]) <= cast(int, current["sequence"]))
+            ):
+                continue
+            merged[screen] = deepcopy(own)
+        now = _time(datetime.now(timezone.utc).isoformat())
+        return {
+            screen: value
+            for screen, value in merged.items()
+            if now - _time(cast(str, value["started_at"])) < 86_400_000_000
+        }
+
+    def _swap(
+        self, record: _Record, expected: bytes | None, state: dict[str, object]
+    ) -> bool:
+        if record.raw != expected:
+            return False
+        self._commit(record, state)
+        return True
+
+    def _rejoin(self, record: _Record, latest: dict[str, object]) -> dict[str, object]:
+        base, memory = self._baseline, self._pending
+        assert memory is not None
+        for _ in range(3):
+            raw = record.raw
+            applied = self._candidate is not None and (
+                latest == self._candidate
+                or (
+                    self._auth_state(latest) == self._auth_state(self._candidate)
+                    and cast(int, latest["generation"])
+                    >= cast(int, self._candidate["generation"])
+                    and base is not None
+                    and self._auth_state(self._candidate) != self._auth_state(base)
+                )
+            )
+            if (
+                base is None
+                or (
+                    latest["auth_generation"] != base["auth_generation"] and not applied
+                )
+                or (cast(int, latest["generation"]) < cast(int, base["generation"]))
+            ):
+                self._volatile = False
+                self._pending = self._candidate = self._pending_view = None
+                self._credentials = None
+                self._generation = cast(int, latest["generation"])
+                self._auth_generation = cast(int, latest["auth_generation"])
+                self._auth_high_water = max(
+                    self._auth_high_water, self._auth_generation
+                )
+                self._baseline = deepcopy(latest)
+                self._retired_screens.clear()
+                self._memory_success = False
+                self._auth_request = self._refresh_request = None
+                self._auth_in_progress = None
+                self._peer_blocked = bool(
+                    latest["refresh_unknown"] or latest["auth_unknown"]
+                )
+                self._discarded = True
+                return latest
+            merged = deepcopy(latest)
+            own_markers = {
+                "refresh": self._refresh_request,
+                "auth": self._auth_request,
+            }
+            install = latest["session"] == base["session"] and all(
+                not base[kind + "_unknown"]
+                or (
+                    request is not None
+                    and base[kind + "_request"] == request
+                    and latest[kind + "_request"] == request
+                    and latest[kind + "_unknown"] is True
+                )
+                for kind, request in own_markers.items()
+                if base[kind + "_unknown"] and not memory[kind + "_unknown"]
+            )
+            if install:
+                merged["session"] = deepcopy(memory["session"])
+                merged["auth_generation"] = memory["auth_generation"]
+                for kind, request in own_markers.items():
+                    if (
+                        base[kind + "_unknown"]
+                        and not memory[kind + "_unknown"]
+                        and request is not None
+                        and latest[kind + "_request"] == request
+                    ):
+                        merged[kind + "_unknown"] = False
+                        merged[kind + "_request"] = None
+            merged["attempts"] = self._merge_attempts(base, memory, latest)
+            if merged != latest:
+                merged["generation"] = cast(int, latest["generation"]) + 1
+            self._pending_view = deepcopy(merged)
+            self._peer_blocked = bool(
+                merged["refresh_unknown"] or merged["auth_unknown"]
+            )
+            self._load(merged)
+            if len(cast(dict[str, object], merged["attempts"])) > _MAX_ATTEMPTS:
+                raise _storage_error("resource_exhausted")
+            if merged != latest:
+                if not self._swap(record, raw, merged):
+                    latest = self._read(record)
+                    continue
+            self._volatile = False
+            self._pending = self._candidate = self._pending_view = None
+            self._retired_screens.clear()
+            if not merged["refresh_unknown"]:
+                self._refresh_request = None
+            if not merged["auth_unknown"]:
+                self._auth_request = None
+                self._auth_in_progress = None
+            return merged
+        raise _storage_error("failed_precondition")
 
     def _restore(self, record: _Record) -> dict[str, object]:
         state = self._read(record)
-        if state["auth_unknown"] and self._auth_in_progress != (
-            state["auth_generation"],
-            state["session"],
+        if self._volatile:
+            return self._rejoin(record, state)
+        if self._baseline is not None and any(
+            state[kind + "_unknown"]
+            and (
+                not self._baseline[kind + "_unknown"]
+                or state[kind + "_request"] != self._baseline[kind + "_request"]
+            )
+            for kind in ("refresh", "auth")
+        ):
+            self._peer_blocked = True
+        if (
+            self._baseline is None
+            and state["auth_unknown"]
+            and self._auth_in_progress
+            != (
+                state["auth_generation"],
+                state["session"],
+            )
         ):
             cleaned = {
                 **state,
                 "session": None,
                 "auth_unknown": False,
                 "refresh_unknown": False,
+                "auth_request": None,
+                "refresh_request": None,
                 "generation": cast(int, state["generation"]) + 1,
                 "auth_generation": cast(int, state["auth_generation"]) + 1,
             }
@@ -588,49 +824,43 @@ class _DeviceStore(_DeviceSessionStore):
                 pass
             else:
                 state = cleaned
+        self._baseline = deepcopy(state)
         return state
 
     def _snapshot(self) -> dict[str, object]:
+        return self._view()
+
+    def _view(self) -> dict[str, object]:
         with self._locked():
             self._check_loop()
-            if self._volatile:
-                raise _storage_error("failed_precondition")
-            with self._transaction() as record:
-                state = self._restore(record)
+            self._discarded = False
+            try:
+                with self._transaction() as record:
+                    state = self._restore(record)
+            except ClientError as error:
+                if (
+                    self._memory_success
+                    and self._baseline is not None
+                    and self._credentials is not None
+                    and not self._volatile
+                    and self._recoverable(error)
+                ):
+                    self._hold(self._baseline)
+                if not self._volatile or not self._recoverable(error):
+                    raise
+                overlay = self._pending_view or self._pending
+                assert overlay is not None
+                state = deepcopy(overlay)
+            if not self._discarded:
                 self._load(state)
-                return state
+            return state
 
     def credentials(self) -> SessionCredentials | None:
         with self._locked():
             self._check_loop()
             if self._storage_blocked:
                 raise _storage_error("failed_precondition")
-            try:
-                with self._transaction() as record:
-                    state = self._restore(record)
-                    if self._volatile:
-                        if (
-                            cast(int, state["auth_generation"])
-                            <= self._persisted_auth_generation
-                        ):
-                            return self._credentials
-                        self._credentials = None
-                        self._volatile = False
-                        self._retired_screens.clear()
-                        return None
-                    self._load(state)
-            except ClientError as error:
-                if (
-                    self._volatile
-                    and error._storage_failure
-                    and error.code
-                    in {
-                        "failed_precondition",
-                        "resource_exhausted",
-                    }
-                ):
-                    return self._credentials
-                raise
+            self._view()
             return self._credentials
 
     def _attach(self, mode: Literal["sync", "async"], origin: str) -> None:
@@ -651,18 +881,26 @@ class _DeviceStore(_DeviceSessionStore):
             with self._transaction() as record:
                 state = self._read(record)
                 state.update(
-                    auth_generation=_next_auth_generation(state, credentials),
+                    auth_generation=_next_auth_generation(
+                        state, credentials, floor=self._auth_high_water
+                    ),
                     session=asdict(credentials),
                     generation=cast(int, state["generation"]) + 1,
                     refresh_unknown=False,
                     auth_unknown=False,
+                    refresh_request=None,
+                    auth_request=None,
                 )
                 self._write(record, state)
                 # A run-local overlay can share the committed generation.
                 self._credentials = None
                 self._load(state)
             self._volatile = False
+            self._pending = self._candidate = self._pending_view = None
             self._retired_screens.clear()
+            self._memory_success = False
+            self._auth_request = self._refresh_request = None
+            self._auth_in_progress = None
             self._condition.notify_all()
 
     def clear(self, expected: SessionCredentials) -> None:
@@ -687,14 +925,20 @@ class _DeviceStore(_DeviceSessionStore):
                         attempts={},
                         refresh_unknown=False,
                         auth_unknown=False,
+                        refresh_request=None,
+                        auth_request=None,
                         generation=cast(int, state["generation"]) + 1,
-                        auth_generation=auth_generation + 1,
+                        auth_generation=max(auth_generation, self._auth_high_water) + 1,
                     )
                     self._write(record, state)
                 self._volatile = False
+                self._pending = self._candidate = self._pending_view = None
                 self._credentials = None
+                self._auth_request = self._refresh_request = None
+                self._auth_in_progress = None
                 self._load(state)
                 self._condition.notify_all()
+                self._memory_success = False
 
     @staticmethod
     def _validate_attempt(screen_id: str, value: object) -> _Attempt:
@@ -730,12 +974,8 @@ class _DeviceStore(_DeviceSessionStore):
         return _Attempt(record)
 
     def _attempt(self, screen_id: str) -> _Attempt | None:
-        if self._volatile and screen_id in self._retired_screens:
-            return None
-        with self._locked(), self._transaction() as record:
-            state = self._read(record)
-            if not self._volatile:
-                self._load(state)
+        with self._locked():
+            state = self._snapshot()
             attempts = cast(dict[str, object], state["attempts"])
             value = attempts.get(screen_id)
             return None if value is None else self._validate_attempt(screen_id, value)
@@ -747,25 +987,76 @@ class _DeviceStore(_DeviceSessionStore):
         *,
         expected_generation: int,
         remove_screens: tuple[str, ...] = (),
+        expected_auth_generation: int | None = None,
     ) -> bool:
-        if self._volatile:
-            raise _storage_error("failed_precondition")
         attempt = self._validate_attempt(screen_id, dict(value))
-        with self._locked(), self._transaction() as record:
-            state = self._read(record)
-            if state["generation"] != expected_generation:
-                self._load(state)
-                return False
-            attempts = cast(dict[str, object], state["attempts"])
-            for screen in remove_screens:
-                attempts.pop(screen, None)
-            if screen_id not in attempts and len(attempts) >= _MAX_ATTEMPTS:
-                raise _storage_error("resource_exhausted")
-            attempts[screen_id] = attempt
-            state["generation"] = expected_generation + 1
-            self._write(record, state)
-            self._load(state)
-            return True
+        with self._locked():
+            auth_generation = (
+                self._auth_generation
+                if expected_auth_generation is None
+                else expected_auth_generation
+            )
+            candidate = None
+            try:
+                with self._transaction() as record:
+                    self._discarded = False
+                    state = self._restore(record)
+                    if (
+                        self._discarded
+                        or state["generation"] != expected_generation
+                        or state["auth_generation"] != auth_generation
+                    ):
+                        if not self._discarded:
+                            self._load(state)
+                        return False
+                    attempts = cast(dict[str, object], state["attempts"])
+                    for screen in remove_screens:
+                        attempts.pop(screen, None)
+                    if screen_id not in attempts and len(attempts) >= _MAX_ATTEMPTS:
+                        raise _storage_error("resource_exhausted")
+                    attempts[screen_id] = attempt
+                    state["generation"] = expected_generation + 1
+                    candidate = state
+                    self._commit(record, state)
+                    self._load(state)
+                    return True
+            except ClientError as error:
+                if candidate is not None and self._recoverable(error):
+                    self._hold(candidate)
+                elif (
+                    self._location_ready
+                    and self._recoverable(error)
+                    and candidate is None
+                ):
+                    # No verified baseline remains distinct from an empty store.
+                    fallback = self._pending or self._baseline
+                    if fallback is None:
+                        state = {
+                            "version": 1,
+                            "scope": self._scope,
+                            "generation": expected_generation,
+                            "auth_generation": auth_generation,
+                            "session": None,
+                            "attempts": {},
+                            "refresh_unknown": False,
+                            "auth_unknown": False,
+                            "refresh_request": None,
+                            "auth_request": None,
+                        }
+                    else:
+                        state = deepcopy(fallback)
+                    if (
+                        state["generation"] == expected_generation
+                        and state["auth_generation"] == auth_generation
+                    ):
+                        attempts = cast(dict[str, object], state["attempts"])
+                        for screen in remove_screens:
+                            attempts.pop(screen, None)
+                        if screen_id in attempts or len(attempts) < _MAX_ATTEMPTS:
+                            attempts[screen_id] = attempt
+                            state["generation"] = expected_generation + 1
+                            self._hold(state)
+                raise
 
     def _remove_attempts(
         self,
@@ -774,10 +1065,8 @@ class _DeviceStore(_DeviceSessionStore):
         expected_generation: int,
         expected_auth_generation: int,
     ) -> bool:
-        if self._volatile:
-            raise _storage_error("failed_precondition")
         with self._locked(), self._transaction() as record:
-            state = self._read(record)
+            state = self._restore(record)
             if (
                 state["generation"] != expected_generation
                 or state["auth_generation"] != expected_auth_generation
@@ -787,7 +1076,11 @@ class _DeviceStore(_DeviceSessionStore):
             for screen in screens:
                 cast(dict[str, object], state["attempts"]).pop(screen, None)
             state["generation"] = expected_generation + 1
-            self._write(record, state)
+            try:
+                self._commit(record, state)
+            except (ClientError, OSError):
+                self._hold(state)
+                raise
             self._load(state)
             return True
 
@@ -801,17 +1094,78 @@ class _DeviceStore(_DeviceSessionStore):
         expected_auth_generation: int | None = None,
         auth_unknown: bool = False,
     ) -> bool:
-        if self._volatile:
-            raise _storage_error("failed_precondition")
         if credentials is not None:
             _native(credentials)
             if user_id != credentials.user_id:
                 raise ClientError("invalid_argument")
         with self._locked(), self._transaction(block_on_failure=True) as record:
-            state = self._read(record)
-            if state["generation"] != expected_generation or (
-                expected_auth_generation is not None
-                and state["auth_generation"] != expected_auth_generation
+            self._discarded = False
+            latest = self._read(record) if auth_unknown and self._peer_blocked else None
+            if latest is not None and any(
+                latest[kind + "_unknown"]
+                and (
+                    latest[kind + "_request"] is None
+                    or latest[kind + "_request"] != owned_request
+                )
+                for kind, owned_request in (
+                    ("refresh", self._refresh_request),
+                    ("auth", self._auth_request),
+                )
+            ):
+                state = latest
+                persisted_auth = (
+                    self._baseline["auth_generation"]
+                    if self._volatile and self._baseline is not None
+                    else self._auth_generation
+                )
+                if (
+                    expected_generation != self._generation
+                    or state["auth_generation"] != persisted_auth
+                    or (
+                        expected_auth_generation is not None
+                        and expected_auth_generation != self._auth_generation
+                    )
+                ):
+                    return False
+                if screens is None:
+                    raise ClientError("invalid_argument")
+                state["attempts"] = self._merge_attempts(state, state, state)
+                state.update(
+                    session=None,
+                    refresh_unknown=False,
+                    auth_unknown=False,
+                    refresh_request=None,
+                    auth_request=None,
+                    generation=max(
+                        cast(int, state["generation"]),
+                        self._generation,
+                        cast(int, (self._pending or state)["generation"]),
+                    )
+                    + 1,
+                    auth_generation=max(
+                        cast(int, state["auth_generation"]), self._auth_high_water
+                    )
+                    + 1,
+                )
+                if not self._swap(record, record.raw, state):
+                    return False
+                self._volatile = False
+                self._pending = self._candidate = self._pending_view = None
+                self._retired_screens.clear()
+                self._memory_success = False
+                self._auth_request = self._refresh_request = None
+                self._auth_in_progress = None
+                self._load(state)
+                self._condition.notify_all()
+                return True
+            state = self._restore(record)
+            if (
+                state["generation"] != expected_generation
+                or (
+                    expected_auth_generation is not None
+                    and state["auth_generation"] != expected_auth_generation
+                )
+                or self._discarded
             ):
                 self._load(state)
                 return False
@@ -827,7 +1181,12 @@ class _DeviceStore(_DeviceSessionStore):
                     raise ClientError("invalid_argument")
                 if state["auth_unknown"] or state["refresh_unknown"]:
                     raise ClientError("failed_precondition")
-                state.update(auth_unknown=True, generation=expected_generation + 1)
+                request = str(uuid4())
+                state.update(
+                    auth_unknown=True,
+                    auth_request=request,
+                    generation=expected_generation + 1,
+                )
                 try:
                     self._write(record, state)
                 except (ClientError, OSError):
@@ -836,8 +1195,20 @@ class _DeviceStore(_DeviceSessionStore):
                     cast(int, state["auth_generation"]),
                     state["session"],
                 )
+                self._auth_request = request
                 self._load(state)
                 return True
+            if credentials is not None:
+                for kind, owned_request in (
+                    ("refresh", self._refresh_request),
+                    ("auth", self._auth_request),
+                ):
+                    if (owned_request is not None or state[kind + "_unknown"]) and (
+                        owned_request is None
+                        or not state[kind + "_unknown"]
+                        or state[kind + "_request"] != owned_request
+                    ):
+                        raise ClientError("failed_precondition")
             attempts = cast(dict[str, object], state["attempts"])
             if screens is None:
                 attempts.clear()
@@ -846,15 +1217,21 @@ class _DeviceStore(_DeviceSessionStore):
                     attempts.pop(screen, None)
             state.update(
                 auth_generation=_next_auth_generation(
-                    state, credentials, scoped_delete=screens is None
+                    state,
+                    credentials,
+                    scoped_delete=screens is None,
+                    floor=self._auth_high_water,
                 ),
                 session=asdict(credentials) if credentials else None,
                 generation=expected_generation + 1,
                 refresh_unknown=False,
                 auth_unknown=False,
+                refresh_request=None,
+                auth_request=None,
             )
-            self._write(record, state)
+            self._commit(record, state)
             self._auth_in_progress = None
+            self._auth_request = self._refresh_request = None
             self._load(state)
             self._condition.notify_all()
             return True
@@ -919,28 +1296,43 @@ class _DeviceStore(_DeviceSessionStore):
     ) -> None:
         # STORE-ERRORS E1: only verified server credentials can enter this overlay.
         with self._locked():
-            self._persisted_auth_generation = persisted_auth_generation
-            self._persisted_session = persisted_session
-            previous = (
-                asdict(self._credentials) if self._credentials is not None else None
+            state = deepcopy(self._pending or self._baseline)
+            if state is None:
+                state = {
+                    "version": 1,
+                    "scope": self._scope,
+                    "generation": self._generation,
+                    "auth_generation": persisted_auth_generation,
+                    "session": persisted_session,
+                    "attempts": {},
+                    "refresh_unknown": False,
+                    "auth_unknown": False,
+                    "refresh_request": None,
+                    "auth_request": None,
+                }
+            state.update(
+                auth_generation=_next_auth_generation(
+                    state, credentials, floor=self._auth_high_water
+                ),
+                session=asdict(credentials),
+                generation=self._generation + 1,
+                refresh_unknown=False,
+                auth_unknown=False,
+                refresh_request=None,
+                auth_request=None,
             )
-            self._auth_generation = _next_auth_generation(
-                {"auth_generation": self._auth_generation, "session": previous},
-                credentials,
-            )
+            for screen in screens:
+                cast(dict[str, object], state["attempts"]).pop(screen, None)
+            self._hold(state)
+            self._memory_success = True
             self._credentials = replace(credentials)
-            self._generation += 1
-            self._blocked_generation = self._generation
             self._storage_blocked = False
-            self._volatile = True
             self._retired_screens.update(screens)
             self._condition.notify_all()
 
     def _begin_refresh(self, snapshot: SessionCredentials, generation: int) -> None:
-        if self._volatile:
-            raise _storage_error("failed_precondition")
         with self._locked(), self._transaction() as record:
-            state = self._read(record)
+            state = self._restore(record)
             if (
                 state["generation"] != generation
                 or state["refresh_unknown"]
@@ -949,8 +1341,11 @@ class _DeviceStore(_DeviceSessionStore):
                 self._load(state)
                 raise ClientError("failed_precondition")
             state["refresh_unknown"] = True
+            request = str(uuid4())
+            state["refresh_request"] = request
             self._write(record, state)
             self._load(state)
+            self._refresh_request = request
             self._refresh_auth_generations[generation] = self._auth_generation
 
     def _apply_refresh(
