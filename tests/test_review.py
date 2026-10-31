@@ -560,6 +560,7 @@ def test_package_does_not_export_private_conformance_hooks() -> None:
         "ClientTransport",
         "ClientError",
         "OperationError",
+        "FieldError",
         "SessionCredentials",
         "SessionStore",
     }

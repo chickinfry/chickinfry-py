@@ -10,7 +10,7 @@ from typing import Literal, Protocol, cast, runtime_checkable
 from ._conformance import _ClearAttempt, _HookError, _observer
 from ._origin import canonical_origin
 from ._request_state import _RequestState
-from .errors import ClientError, OperationError
+from .errors import ClientError, FieldError, OperationError
 from .wire import read_record, read_string
 
 
@@ -77,6 +77,8 @@ class _Failure:
     retryable: bool = False
     outcome_unknown: bool = False
     hook_failed: bool = False
+    response_message: str | None = field(default=None, repr=False)
+    fields: tuple[FieldError, ...] = field(default=(), repr=False)
 
     @classmethod
     def from_error(cls, error: ClientError) -> "_Failure":
@@ -86,6 +88,10 @@ class _Failure:
             error.code if isinstance(error, OperationError) else None,
             error._valid_error_envelope if isinstance(error, OperationError) else False,
             outcome_unknown=error._outcome_unknown,
+            response_message=error.response_message
+            if isinstance(error, OperationError)
+            else None,
+            fields=error.fields if isinstance(error, OperationError) else (),
         )
 
     def error(self) -> ClientError:
@@ -93,7 +99,9 @@ class _Failure:
             raise _HookError()
         error: ClientError
         if self.code is not None and self.status is not None:
-            error = OperationError(self.code, self.status)
+            error = OperationError(
+                self.code, self.status, self.response_message, self.fields
+            )
             error._valid_error_envelope = self.valid_error_envelope
         else:
             error = ClientError(self.reason, self.status)

@@ -10,7 +10,7 @@ from typing import cast
 from urllib.request import Request
 
 from ._conformance import _observer
-from .errors import ClientError, OperationError
+from .errors import ClientError, FieldError, OperationError
 
 _REQUEST_LIMIT = 4 * 1024 * 1024
 _RESPONSE_LIMIT = 1024 * 1024
@@ -97,7 +97,14 @@ def _response(data: bytes, status: int) -> object:
         code = value.get("error") if isinstance(value, dict) else None
         valid = isinstance(code, str) and re.fullmatch(r"[a-z_]+", code) is not None
         failure = OperationError(
-            code if valid and isinstance(code, str) else "invalid_response", status
+            code if valid and isinstance(code, str) else "invalid_response",
+            status,
+            cast(str | None, value.get("message"))
+            if valid and isinstance(value, dict)
+            else None,
+            cast(tuple[FieldError, ...], value.get("fields"))
+            if valid and isinstance(value, dict)
+            else (),
         )
         failure._valid_error_envelope = valid
         raise failure

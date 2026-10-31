@@ -14,6 +14,7 @@ from typing import Protocol, cast
 
 import pytest
 
+from chickinfry import HTTP, AsyncHTTP
 from chickinfry._auth_database import Database, create_database
 from chickinfry.auth import Auth
 from chickinfry.errors import OperationError as ReceivedOperationError
@@ -35,6 +36,8 @@ from chickinfry.server import (
     create_worker_entrypoint,
 )
 
+from .fixtures.plain.sdk import AsyncClient, Client, ProbeEchoInput
+from .peer import Peer, Received, respond
 from .server_fixture import Harness, records
 
 
@@ -1008,6 +1011,46 @@ async def test_workers_failed_setup_releases_requests(
     assert not isinstance(state, BaseException)
     for name in ("__traceback__", "__cause__", "__context__"):
         assert getattr(state, name, None) is None
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+async def test_server_error_reaches_generated_client(mode: str) -> None:
+    probe = Probe()
+    probe.failure = OperationError(
+        "invalid_input", 422, "Safe", (FieldError("wire_value", "too_large"),)
+    )
+    app = Application(
+        {
+            "probe.echo": Operation(
+                decode, probe.invoke, encode, frozenset({"wire_value"})
+            )
+        },
+        probe.open,
+    )
+
+    async def handler(request: Received, writer: asyncio.StreamWriter) -> None:
+        response = await app.fetch(BytesRequest([request.body]))
+        await respond(writer, response.body, status=response.status)
+
+    async with Peer(handler) as peer:
+        with pytest.raises(ReceivedOperationError) as caught:
+            if mode == "sync":
+                with HTTP(peer.origin) as transport:
+                    await asyncio.to_thread(
+                        Client(transport).probe.echo, ProbeEchoInput(wire_value="ok")
+                    )
+            else:
+                async with AsyncHTTP(peer.origin) as transport_async:
+                    await AsyncClient(transport_async).probe.echo(
+                        ProbeEchoInput(wire_value="ok")
+                    )
+        error = caught.value
+        assert error.code == "invalid_input" and error.status == 422
+        assert error.response_message == "Safe"
+        assert error.fields == (FieldError("wire_value", "too_large"),)
+        assert not isinstance(error, OperationError)
+        assert len(peer.received) == probe.calls == probe.closed == 1
+        assert not error._outcome_unknown
 
 
 @pytest.mark.parametrize(

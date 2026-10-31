@@ -86,6 +86,12 @@ OS resolver; the 30-second attempt and 90-second call limits are not guaranteed
 while DNS is blocked. A refresh producer remains tracked until it exits.
 
 `OperationError` is a `ClientError` with the server's `code` and HTTP `status`.
+Validated server descriptions are available as `response_message` (`None` when
+absent or invalid; empty strings are preserved). For `invalid_input`, `fields`
+is an immutable tuple of frozen `FieldError(path, code)` values. Invalid optional
+details are discarded independently while code and HTTP status are preserved.
+Session refresh failure snapshots preserve both details and the existing request
+outcome uncertainty; they do not add automatic business retries.
 Printing either error gives an English sentence with a next action; use the
 `reason`, `code`, and `status` attributes for programmatic error handling.
 Local failures expose a safe `reason` and an optional received `status`, without
