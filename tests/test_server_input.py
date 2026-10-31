@@ -3,7 +3,7 @@ from collections.abc import Mapping
 
 import pytest
 
-from chickinfry.server import MAX_REQUEST_BYTES, Application, Operation, ServerError
+from chickinfry.server import MAX_REQUEST_BYTES, Application, Operation, OperationError
 
 from .test_server_dispatch import BytesRequest, Probe
 
@@ -70,7 +70,7 @@ def test_overflow_is_checked_before_default_materialization(
         return value
 
     monkeypatch.setattr(json, "loads", decode)
-    with pytest.raises(ServerError) as error:
+    with pytest.raises(OperationError) as error:
         _input.read_field({}, "large", budget, literal)
     assert (error.value.code, error.value.status) == ("request_too_large", 413)
     assert calls == []
@@ -149,7 +149,7 @@ def test_nested_default_budget_counts_each_insertion_once() -> None:
     assert read_field(items[0], "child", budget, '"x"') == "x"
     assert budget.size == before == len(b'{"items":[{"child":"x"}]}')
     budget.size = MAX_REQUEST_BYTES
-    with pytest.raises(ServerError) as error:
+    with pytest.raises(OperationError) as error:
         read_field(items[0], "other", budget, '"x"')
     assert (error.value.code, error.value.status) == ("request_too_large", 413)
 
@@ -164,7 +164,7 @@ async def test_decoder_does_not_promote_unrelated_server_errors(
     probe = Probe()
 
     def decode(value: Mapping[str, object]) -> str:
-        raise ServerError(code, status)
+        raise OperationError(code, status)
 
     app = Application(
         {"probe.echo": Operation(decode, probe.invoke, lambda x: {})}, probe.open

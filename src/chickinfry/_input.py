@@ -5,7 +5,7 @@ import math
 from collections.abc import Callable, Mapping
 from typing import TypeVar, cast
 
-from .server import MAX_REQUEST_BYTES, ServerError
+from .server import MAX_REQUEST_BYTES, OperationError
 
 T = TypeVar("T")
 
@@ -113,7 +113,7 @@ class InputBudget:
 
     def _check(self) -> None:
         if self.size > MAX_REQUEST_BYTES:
-            raise ServerError("request_too_large", 413)
+            raise OperationError("request_too_large", 413)
 
 
 def read_field(

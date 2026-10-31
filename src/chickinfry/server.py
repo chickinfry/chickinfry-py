@@ -16,6 +16,9 @@ from types import MappingProxyType
 from typing import Generic, Protocol, TypeVar, cast, overload
 from urllib.parse import urlsplit
 
+from ._error_details import FieldError as FieldError
+from ._error_details import _fields, _message, _string
+
 Input = TypeVar("Input")
 Output = TypeVar("Output")
 C = TypeVar("C")
@@ -23,14 +26,20 @@ S = TypeVar("S")
 Options = TypeVar("Options")
 _C = TypeVar("_C", contravariant=True)
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
-_STATUSES = frozenset({400, 401, 403, 404, 409, 413, 415, 429, 500, 503})
 
 
-class ServerError(Exception):
+class OperationError(Exception):
     """An explicitly trusted business error; received SDK errors are not trusted automatically."""
 
-    def __init__(self, code: str, status: int) -> None:
+    def __init__(
+        self,
+        code: str,
+        status: int,
+        message: str | None = None,
+        fields: tuple[FieldError, ...] = (),
+    ) -> None:
         self.code, self.status = code, status
+        self.message, self.fields = message, fields
         super().__init__("Operation failed.")
 
 
@@ -109,6 +118,8 @@ class Response:
 class DispatchOperation(Protocol[_C]):
     """Receives raw JSON so authorization wrappers can defer input decoding."""
 
+    @property
+    def input_fields(self) -> frozenset[str]: ...
     def prepare(self, value: object) -> Callable[[_C], Awaitable[object]]: ...
 
 
@@ -119,23 +130,24 @@ class Operation(Generic[Input, Output, C]):
     decode: Callable[[Mapping[str, object]], Input]
     invoke: Callable[[C, Input], Awaitable[Output]]
     encode: Callable[[Output], object]
+    input_fields: frozenset[str] = frozenset()
 
     def prepare(self, value: object) -> Callable[[C], Awaitable[object]]:
         try:
             decoded = self.decode(_input_record(value))
-        except ServerError as error:
+        except OperationError as error:
             if error.code == "request_too_large" and error.status == 413:
                 raise
-            raise ServerError("invalid_input", 400) from None
+            raise OperationError("invalid_input", 400) from None
         except Exception:
-            raise ServerError("invalid_input", 400) from None
+            raise OperationError("invalid_input", 400) from None
 
         async def run(context: C) -> object:
             result = await self.invoke(context, decoded)
             try:
                 return self.encode(result)
             except Exception:
-                raise ServerError("operation_failed", 500) from None
+                raise OperationError("operation_failed", 500) from None
 
         return run
 
@@ -154,8 +166,52 @@ def _invalid_constant(value: str) -> object:
 
 def _input_record(value: object) -> Mapping[str, object]:
     if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
-        raise ServerError("invalid_input", 400)
+        raise OperationError("invalid_input", 400)
     return cast(Mapping[str, object], value)
+
+
+def _error_response(
+    error: Exception, headers: Mapping[str, str], declared: object
+) -> Response:
+    try:
+        if isinstance(error, OperationError):
+            code, status = _string(error.code), error.status
+            if (
+                code is not None
+                and re.fullmatch(r"[a-z_]{1,64}", code)
+                and type(status) is int
+                and 400 <= status <= 599
+            ):
+                body: dict[str, object] = {"error": code}
+                try:
+                    message = _message(error.message)
+                except Exception:
+                    message = None
+                if message is not None:
+                    body["message"] = message
+                try:
+                    fields = (
+                        _fields(
+                            error.fields,
+                            declared
+                            if isinstance(declared, frozenset)
+                            else frozenset(),
+                        )
+                        if code == "invalid_input"
+                        else ()
+                    )
+                except Exception:
+                    fields = ()
+                if fields:
+                    body["fields"] = [
+                        {"path": item.path, "code": item.code} for item in fields
+                    ]
+                return Response(
+                    status, json.dumps(body, separators=(",", ":")).encode(), headers
+                )
+    except Exception:
+        pass
+    return Response(500, b'{"error":"operation_failed"}', headers)
 
 
 class Application(Generic[C]):
@@ -183,11 +239,12 @@ class Application(Generic[C]):
         if self.no_store:
             headers["Cache-Control"] = "no-store"
         scope: RequestScope[C] | None = None
+        input_fields: frozenset[str] = frozenset()
         try:
             origin = request.headers.get("origin")
             if origin is not None:
                 if origin not in self.origins:
-                    raise ServerError("origin_denied", 403)
+                    raise OperationError("origin_denied", 403)
                 headers.update(
                     {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
                 )
@@ -206,22 +263,22 @@ class Application(Generic[C]):
                 or "?" in request.url
                 or url.fragment
             ):
-                raise ServerError("not_found", 404)
+                raise OperationError("not_found", 404)
             operation = (
                 self.operations.get(url.path[1:]) if url.path.startswith("/") else None
             )
             if operation is None:
-                raise ServerError("not_found", 404)
+                raise OperationError("not_found", 404)
             if (
                 request.headers.get("content-type", "").split(";", 1)[0]
                 != "application/json"
             ):
-                raise ServerError("unsupported_media_type", 415)
+                raise OperationError("unsupported_media_type", 415)
             body = bytearray()
             try:
                 async for chunk in request.chunks():
                     if len(body) + len(chunk) > MAX_REQUEST_BYTES:
-                        raise ServerError("request_too_large", 413)
+                        raise OperationError("request_too_large", 413)
                     body.extend(chunk)
             except BaseException:
                 try:
@@ -234,7 +291,8 @@ class Application(Generic[C]):
                     body.decode("utf-8"), parse_constant=_invalid_constant
                 )
             except (ValueError, UnicodeError, RecursionError):
-                raise ServerError("invalid_json", 400) from None
+                raise OperationError("invalid_json", 400) from None
+            input_fields = operation.input_fields
             prepared = operation.prepare(value)
             scope = await self.open_scope(request)
             output = await prepared(scope.context)
@@ -242,24 +300,8 @@ class Application(Generic[C]):
                 output, ensure_ascii=False, allow_nan=False, separators=(",", ":")
             ).encode("utf-8")
             return Response(200, encoded, headers)
-        except ServerError as error:
-            safe = (
-                isinstance(error.code, str)
-                and re.fullmatch(r"[a-z_]{1,64}", error.code)
-                and type(error.status) is int
-                and (
-                    error.status in _STATUSES
-                    or (error.status == 501 and error.code == "not_implemented")
-                )
-            )
-            code, status = (
-                (error.code, error.status) if safe else ("operation_failed", 500)
-            )
-            if status == 501:
-                return Response(501, b'{"error":"not_implemented"}', headers)
-            return Response(status, json.dumps({"error": code}).encode(), headers)
-        except Exception:
-            return Response(500, b'{"error":"operation_failed"}', headers)
+        except Exception as error:
+            return _error_response(error, headers, input_fields)
         finally:
             if scope is not None:
                 try:
@@ -274,7 +316,7 @@ def bearer(headers: Mapping[str, str]) -> str | None:
         return None
     match = re.fullmatch(r"Bearer ([A-Za-z0-9_-]{43})", value, re.IGNORECASE)
     if match is None:
-        raise ServerError("invalid_token", 401)
+        raise OperationError("invalid_token", 401)
     return match[1]
 
 

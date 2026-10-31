@@ -15,10 +15,10 @@ from chickinfry.server import (
     Application,
     AuthContext,
     Operation,
+    OperationError,
     Request,
     RequestInfo,
     RequestScope,
-    ServerError,
     Session,
     bearer,
 )
@@ -152,7 +152,7 @@ async def test_auth_context_dispatch(
             )
         session = scope.session
         if session is None:
-            raise ServerError("unauthenticated", 401)
+            raise OperationError("unauthenticated", 401)
         return await protected(
             ProtectedContext(
                 auth=AuthContext(session), db=scope.db, request=scope.request
