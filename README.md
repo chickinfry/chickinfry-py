@@ -143,6 +143,19 @@ details are discarded independently; valid code and status are preserved.
 errors have distinct type identities; received SDK errors are never trusted as
 public server errors. The former server error name has no compatibility alias.
 
+Generated SDKs use `SignupBinding` with the synchronous and asynchronous
+transports for required email verification. Signup preserves the server's
+`accepted` and `attempt` response instead of treating it as session credentials.
+Verification and resend omit an unspecified target, or use this client's last
+successful signup attempt when both targets are omitted. Providing both `email`
+and `attempt` raises `ClientError` with code `invalid_argument` before HTTP.
+The same error is returned without HTTP when no target or pending attempt exists.
+Failed verification retains the attempt; successful verification consumes it.
+
+This binding lasts for the client instance. Connecting generated sign-in,
+signup, and reset to device storage is a separate follow-up; this does not
+establish persistence through those public authentication paths.
+
 ## Contributing
 
 Install development tools with `python -m pip install -r requirements-dev.txt`
