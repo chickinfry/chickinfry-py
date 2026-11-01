@@ -12,6 +12,7 @@ from chickinfry import (
     OperationError,
     SignupBinding,
 )
+from chickinfry.wire import read_record
 
 from .peer import Peer, Received, json_bytes, respond
 from .test_session import credentials
@@ -21,8 +22,6 @@ from .test_session import credentials
 async def invoke(
     request: pytest.FixtureRequest,
 ) -> AsyncIterator[Callable[[str, Mapping[str, object]], Awaitable[object]]]:
-    from chickinfry import SignupBinding
-
     binding = SignupBinding()
     attempts = 0
 
@@ -41,11 +40,28 @@ async def invoke(
                 writer, json_bytes({**asdict(credentials()), "email_verified": True})
             )
         elif received.path == "/auth.signin":
+            email = json.loads(received.body).get("email")
+            if json.loads(received.body).get("password") == "accepted":
+                await respond(
+                    writer,
+                    json_bytes({**asdict(credentials()), "email_verified": True}),
+                )
+                return
+            if email == "unverified@example.invalid":
+                await respond(
+                    writer, json_bytes({"error": "email_not_verified"}), status=403
+                )
+                return
             await respond(
                 writer, json_bytes({"error": "invalid_credentials"}), status=401
             )
         else:
-            await respond(writer, received.body)
+            await respond(
+                writer,
+                json_bytes({"status": "signed_out"})
+                if received.path == "/auth.logout"
+                else received.body,
+            )
 
     async with Peer(handler) as peer:
         async with AsyncHttpTransport(peer.origin, persist=False) as async_transport:
@@ -54,10 +70,14 @@ async def invoke(
                 async def call(operation: str, payload: Mapping[str, object]) -> object:
                     if request.param == "sync":
                         return await asyncio.to_thread(
-                            binding.invoke, sync_transport, operation, payload
+                            binding.invoke,
+                            sync_transport,
+                            operation,
+                            payload,
+                            read_record,
                         )
                     return await binding.invoke_async(
-                        async_transport, operation, payload
+                        async_transport, operation, payload, read_record
                     )
 
                 setattr(call, "requests", peer.received)
@@ -164,9 +184,65 @@ async def test_failed_verification_retains_attempt_until_success(
     assert len(getattr(invoke, "requests")) == count
 
 
+@pytest.mark.parametrize(
+    "operation,email",
+    [
+        ("auth.logout", ""),
+        ("auth.signin", "a@example.invalid"),
+        ("auth.signin", " A@EXAMPLE.INVALID "),
+        ("auth.signin", "\ufeffA@EXAMPLE.INVALID\u00a0"),
+    ],
+)
+async def test_successful_authentication_change_clears_pending_attempt(
+    invoke: Callable[[str, Mapping[str, object]], Awaitable[object]],
+    operation: str,
+    email: str,
+) -> None:
+    await invoke("auth.signup", {"email": "a@example.invalid", "password": "unused"})
+    await invoke(
+        operation,
+        {"email": email, "password": "accepted"} if operation == "auth.signin" else {},
+    )
+    count = len(getattr(invoke, "requests"))
+    with pytest.raises(
+        ClientError, check=lambda error: error.code == "invalid_argument"
+    ):
+        await invoke("auth.verify_email", {"code": "123456"})
+    assert len(getattr(invoke, "requests")) == count
+
+
+async def test_signin_with_another_email_preserves_pending_attempt(
+    invoke: Callable[[str, Mapping[str, object]], Awaitable[object]],
+) -> None:
+    await invoke("auth.signup", {"email": "a@example.invalid", "password": "unused"})
+    await invoke("auth.signin", {"email": "b@example.invalid", "password": "accepted"})
+    await invoke("auth.send_verification_email", {})
+    assert bool(
+        json.loads(getattr(invoke, "requests")[-1].body) == {"attempt": "signup-1"}
+    )
+
+
+async def test_failed_signin_retains_pending_attempt(
+    invoke: Callable[[str, Mapping[str, object]], Awaitable[object]],
+) -> None:
+    await invoke("auth.signup", {"email": "a@example.invalid", "password": "unused"})
+    with pytest.raises(
+        OperationError,
+        check=lambda error: error.code == "email_not_verified" and error.status == 403,
+    ):
+        await invoke(
+            "auth.signin", {"email": "unverified@example.invalid", "password": "unused"}
+        )
+    await invoke("auth.send_verification_email", {})
+    assert bool(
+        json.loads(getattr(invoke, "requests")[-1].body) == {"attempt": "signup-1"}
+    )
+
+
+@pytest.mark.parametrize("same_email", [False, True], ids=["other-email", "same-email"])
 @pytest.mark.parametrize("old_mode,new_mode", [("sync", "async"), ("async", "sync")])
-async def test_old_verification_preserves_new_signup_across_modes(
-    old_mode: str, new_mode: str
+async def test_verification_clears_only_the_snapshotted_email_across_modes(
+    old_mode: str, new_mode: str, same_email: bool
 ) -> None:
     binding = SignupBinding()
     verifying = asyncio.Event()
@@ -199,10 +275,14 @@ async def test_old_verification_preserves_new_signup_across_modes(
                 ) -> object:
                     if mode == "sync":
                         return await asyncio.to_thread(
-                            binding.invoke, sync_transport, operation, payload
+                            binding.invoke,
+                            sync_transport,
+                            operation,
+                            payload,
+                            read_record,
                         )
                     return await binding.invoke_async(
-                        async_transport, operation, payload
+                        async_transport, operation, payload, read_record
                     )
 
                 signup = {"email": "a@example.invalid", "password": "unused"}
@@ -212,10 +292,31 @@ async def test_old_verification_preserves_new_signup_across_modes(
                 )
                 await asyncio.wait_for(verifying.wait(), 5)
                 try:
-                    await asyncio.wait_for(call(new_mode, "auth.signup", signup), 5)
+                    await asyncio.wait_for(
+                        call(
+                            new_mode,
+                            "auth.signup",
+                            {
+                                **signup,
+                                "email": signup["email"]
+                                if same_email
+                                else "b@example.invalid",
+                            },
+                        ),
+                        5,
+                    )
                 finally:
                     release.set()
                     await asyncio.wait_for(task, 5)
+                if same_email:
+                    before = len(peer.received)
+                    with pytest.raises(
+                        ClientError,
+                        check=lambda error: error.code == "invalid_argument",
+                    ):
+                        await call(new_mode, "auth.verify_email", {"code": "123456"})
+                    assert len(peer.received) == before
+                    return
                 await call(new_mode, "auth.send_verification_email", {})
                 assert bool(
                     json.loads(peer.received[-1].body) == {"attempt": "signup-2"}
@@ -227,3 +328,120 @@ async def test_old_verification_preserves_new_signup_across_modes(
                 ):
                     await call(new_mode, "auth.send_verification_email", {})
                 assert len(peer.received) == before
+
+
+@pytest.mark.parametrize(
+    "signup_mode,clear_mode", [("sync", "async"), ("async", "sync")]
+)
+@pytest.mark.parametrize(
+    "action,seed,other_email",
+    [
+        ("logout", True, False),
+        ("logout", False, True),
+        ("signin", True, False),
+        ("signin", True, True),
+        ("signin", False, False),
+        ("verify", True, False),
+        ("verify", True, True),
+        ("verify-email", False, False),
+        ("verify-unknown", True, False),
+    ],
+)
+async def test_pending_signup_cannot_revive_a_cleared_email(
+    signup_mode: str, clear_mode: str, action: str, seed: bool, other_email: bool
+) -> None:
+    binding = SignupBinding()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request: Received, writer: asyncio.StreamWriter) -> None:
+        if request.path == "/auth.signup":
+            delayed = json.loads(request.body).get("password") == "delayed"
+            if delayed:
+                started.set()
+                await release.wait()
+            await respond(
+                writer,
+                json_bytes(
+                    {"accepted": True, "attempt": "late" if delayed else "first"}
+                ),
+            )
+        elif request.path == "/auth.logout":
+            await respond(writer, json_bytes({"status": "signed_out"}))
+        elif request.path == "/auth.send_verification_email":
+            await respond(writer, json_bytes({"accepted": True}))
+        else:
+            await respond(
+                writer, json_bytes({**asdict(credentials()), "email_verified": True})
+            )
+
+    async with Peer(handler) as peer:
+        async with AsyncHttpTransport(peer.origin, persist=False) as async_transport:
+            with HttpTransport(peer.origin, persist=False) as sync_transport:
+
+                async def call(
+                    mode: str, operation: str, payload: Mapping[str, object]
+                ) -> object:
+                    if mode == "sync":
+                        return await asyncio.to_thread(
+                            binding.invoke,
+                            sync_transport,
+                            operation,
+                            payload,
+                            read_record,
+                        )
+                    return await binding.invoke_async(
+                        async_transport, operation, payload, read_record
+                    )
+
+                if seed:
+                    await call(
+                        signup_mode,
+                        "auth.signup",
+                        {"email": "a@example.invalid", "password": "unused"},
+                    )
+                pending = asyncio.create_task(
+                    call(
+                        signup_mode,
+                        "auth.signup",
+                        {
+                            "email": "b@example.invalid"
+                            if other_email
+                            else "a@example.invalid",
+                            "password": "delayed",
+                        },
+                    )
+                )
+                await asyncio.wait_for(started.wait(), 5)
+                try:
+                    if action == "logout":
+                        await call(clear_mode, "auth.logout", {})
+                    elif action == "signin":
+                        await call(
+                            clear_mode,
+                            "auth.signin",
+                            {"email": " A@EXAMPLE.INVALID ", "password": "accepted"},
+                        )
+                    else:
+                        target: dict[str, object] = {"code": "123456"}
+                        if action == "verify-email":
+                            target["email"] = " A@EXAMPLE.INVALID "
+                        elif action == "verify-unknown":
+                            target["attempt"] = "unknown"
+                        await call(clear_mode, "auth.verify_email", target)
+                finally:
+                    release.set()
+                    await asyncio.wait_for(pending, 5)
+                if action != "logout" and (other_email or action == "verify-unknown"):
+                    await call(clear_mode, "auth.send_verification_email", {})
+                    assert bool(
+                        json.loads(peer.received[-1].body) == {"attempt": "late"}
+                    )
+                else:
+                    before = len(peer.received)
+                    with pytest.raises(
+                        ClientError,
+                        check=lambda error: error.code == "invalid_argument",
+                    ):
+                        await call(clear_mode, "auth.verify_email", {"code": "123456"})
+                    assert len(peer.received) == before

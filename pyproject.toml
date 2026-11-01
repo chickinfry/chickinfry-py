@@ -20,7 +20,7 @@ packages = ["src/chickinfry"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src", "tests", "pyproject.toml", "README.md", "LICENSE", "requirements-dev.txt"]
-exclude = ["/tests/test_conformance_driver.py", "/tests/driver_child.py", "/tests/fixtures"]
+exclude = ["/tests/test_conformance_driver.py", "/tests/test_required_signup_driver.py", "/tests/driver_child.py", "/tests/fixtures"]
 
 [tool.ruff]
 target-version = "py311"
