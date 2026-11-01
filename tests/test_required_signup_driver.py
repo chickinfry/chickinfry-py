@@ -159,6 +159,21 @@ async def test_driver_uses_required_sdk_and_exposes_signup_results(
             )
             assert cast(dict[str, object], both["error"])["code"] == "invalid_argument"
             assert len(peer.received) == before
+            for target in (
+                {"email": "single@example.test"},
+                {"attempt": "explicit-attempt"},
+            ):
+                single = await issue(
+                    "client.call",
+                    {
+                        "operation": "auth.verify_email",
+                        "input": {"code": "123456", **target},
+                    },
+                )
+                assert single["error"] is None
+                assert bool(
+                    json.loads(peer.received[-1].body) == {"code": "123456", **target}
+                )
         finally:
             for client in instance.clients.values():
                 if isinstance(client.owner, HttpTransport):

@@ -429,6 +429,12 @@ async def test_pending_signup_cannot_revive_a_cleared_email(
                         elif action == "verify-unknown":
                             target["attempt"] = "unknown"
                         await call(clear_mode, "auth.verify_email", target)
+                        if action == "verify-unknown":
+                            await call(clear_mode, "auth.send_verification_email", {})
+                            assert bool(
+                                json.loads(peer.received[-1].body)
+                                == {"attempt": "first"}
+                            )
                 finally:
                     release.set()
                     await asyncio.wait_for(pending, 5)
