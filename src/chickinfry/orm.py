@@ -14,6 +14,8 @@ from types import MappingProxyType
 from typing import Generic, Literal, Protocol, TypeVar
 from uuid import UUID
 
+from .server import OperationError
+
 T = TypeVar("T")
 R = TypeVar("R")
 ScalarKind = Literal["id", "string", "integer", "date", "timestamp"]
@@ -148,25 +150,25 @@ class ColumnBase:
 class Column(ColumnBase, Generic[T]):
     """Generated columns are declared as Column[scalar] to type-check condition values."""
 
-    def equals(self, value: T) -> "Filter":
+    def eq(self, value: T) -> "Filter":
         return Filter("=", self, (value,))
 
-    def not_equals(self, value: T) -> "Filter":
+    def ne(self, value: T) -> "Filter":
         return Filter("<>", self, (value,))
 
-    def greater_than(self, value: T) -> "Filter":
+    def gt(self, value: T) -> "Filter":
         return Filter(">", self, (value,))
 
-    def greater_than_or_equals(self, value: T) -> "Filter":
+    def gte(self, value: T) -> "Filter":
         return Filter(">=", self, (value,))
 
-    def less_than(self, value: T) -> "Filter":
+    def lt(self, value: T) -> "Filter":
         return Filter("<", self, (value,))
 
-    def less_than_or_equals(self, value: T) -> "Filter":
+    def lte(self, value: T) -> "Filter":
         return Filter("<=", self, (value,))
 
-    def in_(self, values: Sequence[T]) -> "Filter":
+    def is_in(self, values: Sequence[T]) -> "Filter":
         if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
             raise ValueError("IN values must be a sequence.")
         return Filter("in", self, tuple(values))
@@ -356,12 +358,21 @@ class Repository(Generic[R]):
         return rows[0] if rows else None
 
     async def insert(self, values: Mapping[str, object]) -> R:
+        return await self._insert(values, upsert=False)
+
+    async def upsert(self, values: Mapping[str, object]) -> R:
+        return await self._insert(values, upsert=True)
+
+    async def _insert(self, values: Mapping[str, object], *, upsert: bool) -> R:
         self._record(values, tuple(self.table.columns))
         if any(name not in values for name in self.table.required_insert):
             raise ValueError("Missing required insert column value.")
         keys = [name for name in self.table.columns if name in values]
         params = [self.table.columns[key].encode(values[key]) for key in keys]
         sql = f"insert into {self._name}"
+        if upsert:
+            # Keep EXCLUDED separate from a table with the same name.
+            sql += ' as "target"'
         if keys:
             names = ", ".join(
                 quote_identifier(self.table.columns[key].name) for key in keys
@@ -373,6 +384,21 @@ class Repository(Generic[R]):
             )
         else:
             sql += " default values"
+        if upsert:
+            if any(key not in values for key in self.table.primary_key):
+                raise ValueError("Upsert requires every primary key value.")
+            mutable = [key for key in keys if key not in self.table.primary_key]
+            if not mutable:
+                raise ValueError("Upsert requires mutable values.")
+            primary = ", ".join(
+                quote_identifier(self.table.columns[key].name)
+                for key in self.table.primary_key
+            )
+            assignments = []
+            for key in mutable:
+                name = quote_identifier(self.table.columns[key].name)
+                assignments.append(f"{name} = excluded.{name}")
+            sql += f" on conflict ({primary}) do update set {', '.join(assignments)}"
         rows = self._rows(
             await self._port.query(sql + " returning " + self._select, params)
         )
@@ -403,8 +429,70 @@ class Repository(Generic[R]):
     async def update(self, key: Mapping[str, object], patch: Mapping[str, object]) -> R:
         row = await self.update_if(key, self._key(key), patch)
         if row is None:
-            raise ValueError("Update result row is missing.")
+            raise OperationError("not_found", 404)
         return row
+
+    async def increment(
+        self, key: Mapping[str, object], columns: Mapping[str, object]
+    ) -> R:
+        row = await self._increment(key, self._key(key), columns, {})
+        if row is None:
+            raise OperationError("not_found", 404)
+        return row
+
+    async def increment_if(
+        self,
+        key: Mapping[str, object],
+        condition: Filter,
+        columns: Mapping[str, object],
+        patch: Mapping[str, object],
+    ) -> R | None:
+        if not patch:
+            raise ValueError(
+                "Increment updates require both increment and set columns."
+            )
+        return await self._increment(key, condition, columns, patch)
+
+    async def _increment(
+        self,
+        key: Mapping[str, object],
+        condition: Filter,
+        columns: Mapping[str, object],
+        patch: Mapping[str, object],
+    ) -> R | None:
+        allowed = tuple(
+            name for name in self.table.columns if name not in self.table.primary_key
+        )
+        self._record(columns, allowed)
+        self._record(patch, allowed)
+        if not columns:
+            raise ValueError("No columns to increment.")
+        if any(name in patch for name in columns):
+            raise ValueError("A column cannot be incremented and set together.")
+        params: list[object] = []
+        assignments = []
+        for name, column in self.table.columns.items():
+            quoted = quote_identifier(column.name)
+            if name in columns:
+                amount = columns[name]
+                if (
+                    column.kind != "integer"
+                    or type(amount) is not int
+                    or amount == 0
+                    or not -9007199254740991 <= amount <= 9007199254740991
+                ):
+                    raise ValueError(
+                        "Increment amounts must be non-zero safe integers for integer columns."
+                    )
+                params.append(amount)
+                assignments.append(f"{quoted} = {quoted} + ${len(params)}::bigint")
+            elif name in patch:
+                params.append(column.encode(patch[name]))
+                assignments.append(f"{quoted} = ${len(params)}")
+        where = _compile(and_(self._key(key), condition), self.table, params)
+        sql = f"update {self._name} set {', '.join(assignments)} where {where} returning {self._select}"
+        rows = self._rows(await self._port.query(sql, params))
+        return rows[0] if rows else None
 
     async def delete(self, key: Mapping[str, object]) -> R | None:
         params: list[object] = []

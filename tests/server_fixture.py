@@ -46,6 +46,7 @@ create table "records""한" (
 );
 create table memberships (org text not null, member text not null, role text not null,
     primary key (org, member));
+create table excluded (like "records""한" including all);
 """
 
 
@@ -59,7 +60,7 @@ class Record:
     happened_on: str | None
 
 
-def records(port: DatabasePort) -> Repository[Record]:
+def records(port: DatabasePort, table: Table = RECORDS) -> Repository[Record]:
     def decode(row: Mapping[str, object]) -> Record:
         return Record(
             read_str(row["id"]),
@@ -70,7 +71,7 @@ def records(port: DatabasePort) -> Repository[Record]:
             read_optional(row["happened_on"]),
         )
 
-    return Repository(port, RECORDS, decode)
+    return Repository(port, table, decode)
 
 
 @dataclass(repr=False)
