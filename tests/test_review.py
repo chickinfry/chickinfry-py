@@ -563,6 +563,7 @@ def test_package_does_not_export_private_conformance_hooks() -> None:
         "FieldError",
         "SessionCredentials",
         "MemoryStore",
+        "SignupBinding",
     }
     for name in chickinfry.__all__:
         assert getattr(chickinfry, name).__name__ == name

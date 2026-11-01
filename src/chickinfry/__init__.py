@@ -2,6 +2,7 @@ from ._sync_http import HttpTransport, Transport
 from .errors import ClientError, FieldError, OperationError
 from .http import AsyncHttpTransport, AsyncTransport
 from .session import MemoryStore, SessionCredentials
+from .signup import SignupBinding
 
 __all__ = [
     "HttpTransport",
@@ -13,4 +14,5 @@ __all__ = [
     "FieldError",
     "SessionCredentials",
     "MemoryStore",
+    "SignupBinding",
 ]
