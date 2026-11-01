@@ -150,7 +150,15 @@ Verification and resend omit an unspecified target, or use this client's last
 successful signup attempt when both targets are omitted. Providing both `email`
 and `attempt` raises `ClientError` with code `invalid_argument` before HTTP.
 The same error is returned without HTTP when no target or pending attempt exists.
-Failed verification retains the attempt; successful verification consumes it.
+Failed verification retains the attempt. Successful verification clears it for
+the verified email when that email is known to the SDK; an unrelated explicit
+attempt does not identify or clear this client's pending signup.
+Successful sign-out clears this client's pending attempt. Successful sign-in
+clears it only for the same signup email, compared after server-compatible
+trimming and lowercase conversion. Other emails and failed calls retain it.
+Older in-flight signup replies cannot restore a cleared email's binding, and
+sign-out invalidates every older signup. State changes follow successful
+decoding of the complete generated result.
 
 This binding lasts for the client instance. Connecting generated sign-in,
 signup, and reset to device storage is a separate follow-up; this does not
