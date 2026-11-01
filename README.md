@@ -156,6 +156,16 @@ This binding lasts for the client instance. Connecting generated sign-in,
 signup, and reset to device storage is a separate follow-up; this does not
 establish persistence through those public authentication paths.
 
+## Server ORM
+
+Generated repositories provide `upsert`, `increment`, and `increment_if` alongside
+insert, lookup, update, and delete. Upserts require every primary key and update
+only supplied mutable columns. Increments change integer columns atomically;
+`increment_if` also checks a filter and applies a patch in the same statement.
+An unmatched conditional write returns `None`; updating or incrementing a missing
+row raises the public server `OperationError` with code `not_found` and status 404.
+Column comparisons use `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, and `is_in`.
+
 ## Contributing
 
 Install development tools with `python -m pip install -r requirements-dev.txt`
