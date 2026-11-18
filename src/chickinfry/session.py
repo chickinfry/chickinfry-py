@@ -126,6 +126,11 @@ class _SyncFlight:
     request_state: _RequestState = field(default_factory=_RequestState, repr=False)
 
 
+_SESSION_ISSUERS = frozenset(
+    {"auth.identity", "auth.signin", "auth.signup", "auth.verify_email"}
+)
+
+
 def _refresh_candidate(operation: str, error: ClientError) -> bool:
     return (
         operation != "auth.refresh"
@@ -150,9 +155,11 @@ class _SessionStore(Protocol):
     def replace(self, credentials: SessionCredentials) -> None: ...
     def clear(self, expected: SessionCredentials) -> None: ...
     def _register(
-        self, deadline: float | None = None
-    ) -> tuple[SessionCredentials, int]: ...
-    def _current(self, snapshot: SessionCredentials, generation: int) -> bool: ...
+        self, deadline: float | None = None, *, allow_empty: bool = False
+    ) -> tuple[SessionCredentials | None, int]: ...
+    def _current(
+        self, snapshot: SessionCredentials | None, generation: int
+    ) -> bool: ...
     def _new_credentials(self, generation: int) -> SessionCredentials | None: ...
     def _begin_refresh(self, snapshot: SessionCredentials, generation: int) -> None: ...
     def _apply_refresh(
@@ -167,6 +174,40 @@ class _SessionStore(Protocol):
     def _settled(
         self, generation: int, task: asyncio.Task[_Failure | None]
     ) -> None: ...
+
+
+def _finish_auth(
+    store: _SessionStore,
+    operation: str,
+    response: object,
+    snapshot: SessionCredentials | None,
+    generation: int,
+    deadline: float | None = None,
+) -> None:
+    if operation not in _SESSION_ISSUERS and operation != "auth.logout":
+        return
+    record = read_record(response)
+    if operation == "auth.logout":
+        read_string(record.get("status"))
+        credentials = None
+    else:
+        if operation == "auth.signup" and "access_token" not in record:
+            return
+        if "email_verified" in record and type(record["email_verified"]) is not bool:
+            raise ClientError("internal")
+        credentials = _read_credentials(record)
+
+    with store._locked(deadline):
+        if not store._current(snapshot, generation):
+            if snapshot is None:
+                return
+            snapshot = store._new_credentials(generation)
+            if snapshot is None:
+                return
+        if credentials is not None:
+            store.replace(credentials)
+        elif snapshot is not None:
+            store.clear(snapshot)
 
 
 class _DeviceSession(Protocol):
@@ -250,6 +291,7 @@ class MemoryStore:
         self._mode: Literal["sync", "async"] | None = None
         self._credentials: SessionCredentials | None = None
         self._generation = 0
+        self._session_boundary = 0
         self._blocked_generation: int | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._active: dict[int, int] = {}
@@ -292,9 +334,8 @@ class MemoryStore:
                 raise _local_error("failed_precondition", "origin_mismatch")
             if self._mode is not None and self._mode != mode:
                 raise ClientError("failed_precondition")
-            if self._credentials is None:
-                raise _local_error("unauthenticated", "invalid_session")
-            _validate(self._credentials)
+            if self._credentials is not None:
+                _validate(self._credentials)
             if mode == "async":
                 self._check_loop()
             else:
@@ -309,11 +350,15 @@ class MemoryStore:
     def replace(self, credentials: SessionCredentials) -> None:
         with self._locked():
             self._check_loop()
-            _validate(credentials)
-            self._credentials = replace(credentials)
-            self._blocked_generation = None
-            self._generation += 1
-            self._condition.notify_all()
+            self._install(credentials)
+            self._session_boundary = self._generation
+
+    def _install(self, credentials: SessionCredentials) -> None:
+        _validate(credentials)
+        self._credentials = replace(credentials)
+        self._blocked_generation = None
+        self._generation += 1
+        self._condition.notify_all()
 
     def clear(self, expected: SessionCredentials) -> None:
         with self._locked():
@@ -322,6 +367,7 @@ class MemoryStore:
             if removed:
                 self._credentials = None
                 self._generation += 1
+                self._session_boundary = self._generation
                 self._condition.notify_all()
             observation = _observer.get()
             if observation is not None and self._clear_attempts is not None:
@@ -330,23 +376,27 @@ class MemoryStore:
                 )
 
     def _register(
-        self, deadline: float | None = None
-    ) -> tuple[SessionCredentials, int]:
+        self, deadline: float | None = None, *, allow_empty: bool = False
+    ) -> tuple[SessionCredentials | None, int]:
         with self._locked(deadline):
             self._check_loop()
             snapshot = self._credentials
-            if snapshot is None:
-                raise _local_error("unauthenticated", "invalid_session")
-            _validate(snapshot)
             generation = self._generation
+            if snapshot is None:
+                if not allow_empty or self._blocked_generation == generation:
+                    raise ClientError("unauthenticated")
+            else:
+                _validate(snapshot)
             self._active[generation] = self._active.get(generation, 0) + 1
             return snapshot, generation
 
-    def _current(self, snapshot: SessionCredentials, generation: int) -> bool:
+    def _current(self, snapshot: SessionCredentials | None, generation: int) -> bool:
         return self._generation == generation and self._credentials is snapshot
 
     def _new_credentials(self, generation: int) -> SessionCredentials | None:
-        return self._credentials if self._generation != generation else None
+        if self._session_boundary <= generation < self._generation:
+            return self._credentials
+        return None
 
     def _begin_refresh(self, snapshot: SessionCredentials, generation: int) -> None:
         pass
@@ -374,7 +424,7 @@ class MemoryStore:
                 )
             return
         if failure is None and credentials is not None:
-            self.replace(credentials)
+            self._install(credentials)
         elif failure is not None:
             if failure.valid_error_envelope and failure.status == 401:
                 self.clear(snapshot)

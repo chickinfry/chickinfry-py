@@ -341,8 +341,8 @@ class _DeviceSessionStore(MemoryStore):
         self._call_auth_generations: dict[int, int] = {}
 
     def _register(
-        self, deadline: float | None = None
-    ) -> tuple[SessionCredentials, int]:
+        self, deadline: float | None = None, *, allow_empty: bool = False
+    ) -> tuple[SessionCredentials | None, int]:
         with self._locked(deadline):
             previous_auth = self._auth_generation
             had_credentials = self._credentials is not None
@@ -352,7 +352,7 @@ class _DeviceSessionStore(MemoryStore):
                 raise _local_error("unauthenticated", "invalid_session")
             if self._peer_blocked:
                 raise _local_error("unauthenticated", "invalid_session")
-            snapshot, generation = super()._register(deadline)
+            snapshot, generation = super()._register(deadline, allow_empty=allow_empty)
             self._call_auth_generations[generation] = self._auth_generation
             return snapshot, generation
 
@@ -362,7 +362,7 @@ class _DeviceSessionStore(MemoryStore):
             if generation not in self._active:
                 self._call_auth_generations.pop(generation, None)
 
-    def _current(self, snapshot: SessionCredentials, generation: int) -> bool:
+    def _current(self, snapshot: SessionCredentials | None, generation: int) -> bool:
         self.credentials()
         return super()._current(snapshot, generation)
 

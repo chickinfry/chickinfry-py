@@ -14,7 +14,7 @@ _MESSAGES = {
     "unimplemented": "This client does not support Python Workers yet (support is planned); make calls from a regular Python process for now.",
     "internal": "The server response is invalid; check that the server and generated client use the same API contract.",
     "unknown": "The client failed for an unknown reason; check the client's configuration and the server's state before making another call.",
-    "unauthenticated": "The request has no eligible session; sign in again before making another call.",
+    "unauthenticated": "The request has no eligible session; use an active session for this operation.",
     "operation_failed": "The operation failed; check the error code and HTTP status, then resolve the reported problem before making another call.",
 }
 _CODES = frozenset(_MESSAGES) - {"operation_failed"}

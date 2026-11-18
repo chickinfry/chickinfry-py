@@ -29,6 +29,7 @@ _T = TypeVar("_T")
     ("status", "code", "operation", "refreshes", "requests"),
     [
         (401, "invalid_token", "thing.run", 1, 2),
+        (401, "invalid_token", "probe.list", 1, 2),
         (401, "other_error", "thing.run", 0, 1),
         (403, "invalid_token", "thing.run", 0, 1),
         (401, "invalid_token", "auth.refresh", 0, 1),
@@ -58,10 +59,14 @@ async def test_sync_refresh_only_once_and_first_bytes(
     async with Peer(handler) as peer:
         with HttpTransport(peer.origin) as owner:
             store = MemoryStore(peer.origin, old)
+            transport = owner.with_session(store)
+            invoke = (
+                getattr(transport, "invoke_public")
+                if operation == "probe.list"
+                else transport.invoke
+            )
             with pytest.raises(OperationError) as caught:
-                await asyncio.to_thread(
-                    owner.with_session(store).invoke, operation, body
-                )
+                await asyncio.to_thread(invoke, operation, body)
             assert caught.value.status == status and caught.value.code == code
             business = [item for item in peer.received if item.path == "/" + operation]
             assert len(business) == requests and all(
@@ -233,14 +238,12 @@ async def test_sync_other_thread_login_logout_preserves_generation(
                 )
             changed = store.credentials()
             release.set()
-            if outcome == "rejected" or action == "logout":
-                with pytest.raises(
-                    OperationError, check=lambda error: error.code == "invalid_token"
-                ):
-                    await task
-            else:
-                assert await task == {}
+            with pytest.raises(
+                OperationError, check=lambda error: error.code == "invalid_token"
+            ):
+                await task
             assert store.credentials() is changed
+            assert len(peer.received) == 2
             assert not store._active and not store._sync_flights
 
 
@@ -633,7 +636,11 @@ async def test_sync_new_login_before_late_401_skips_old_refresh(
                     await asyncio.to_thread(signed.invoke, "thing.early", {})
             await asyncio.to_thread(store.replace, latest)
             release.set()
-            assert await call == {}
+            with pytest.raises(
+                OperationError, check=lambda error: error.code == "invalid_token"
+            ):
+                await call
+            assert len(peer.received) == (3 if old_flight else 1)
             assert (
                 sum(request.path == "/auth.refresh" for request in peer.received)
                 == old_flight
@@ -641,32 +648,15 @@ async def test_sync_new_login_before_late_401_skips_old_refresh(
             assert not store._active and not store._sync_flights
 
 
-@pytest.mark.parametrize("invalid", ["origin", "credentials"])
-async def test_failed_attachment_does_not_pin_mode(invalid: str) -> None:
-    async def handler(request: Received, writer: asyncio.StreamWriter) -> None:
-        await respond(writer)
-
-    async with Peer(handler) as peer:
-        store = MemoryStore(peer.origin, credentials() if invalid == "origin" else None)
-        with HttpTransport(peer.origin) as sync:
-            if invalid == "origin":
-                with pytest.raises(
-                    ClientError, check=lambda error: error.code == "failed_precondition"
-                ):
-                    AsyncHttpTransport("https://example.com").with_session(store)
-                sync.with_session(store)
-                assert store._mode == "sync"
-            else:
-                with pytest.raises(
-                    ClientError, check=lambda error: error.code == "unauthenticated"
-                ):
-                    sync.with_session(store)
-                store.replace(credentials())
-                asynchronous = AsyncHttpTransport(peer.origin)
-                asynchronous.with_session(store)
-                assert store._mode == "async"
-                await asynchronous.aclose()
-            assert not peer.received
+async def test_failed_attachment_does_not_pin_mode() -> None:
+    store = MemoryStore("https://example.test")
+    with pytest.raises(
+        ClientError, check=lambda error: error.code == "failed_precondition"
+    ):
+        AsyncHttpTransport("https://other.example.test").with_session(store)
+    with HttpTransport("https://example.test") as sync:
+        sync.with_session(store)
+        assert store._mode == "sync"
 
 
 async def test_async_refresh_task_factory_runs_outside_store_lock() -> None:

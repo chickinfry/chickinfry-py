@@ -59,6 +59,7 @@ def test_store_snapshot_generation_and_secret_repr() -> None:
     ("status", "code", "operation", "refreshes", "requests"),
     [
         (401, "invalid_token", "thing.run", 1, 2),
+        (401, "invalid_token", "probe.list", 1, 2),
         (401, "other_error", "thing.run", 0, 1),
         (403, "invalid_token", "thing.run", 0, 1),
         (500, "invalid_token", "thing.run", 0, 1),
@@ -97,8 +98,14 @@ async def test_refresh_trigger_and_identical_original_bytes(
 
     async with Peer(handler) as peer, AsyncHttpTransport(peer.origin) as owner:
         store = MemoryStore(peer.origin, old)
+        transport = owner.with_session(store)
+        invoke = (
+            getattr(transport, "invoke_public")
+            if operation == "probe.list"
+            else transport.invoke
+        )
         with pytest.raises(OperationError) as caught:
-            await owner.with_session(store).invoke(operation, payload)
+            await invoke(operation, payload)
         assert caught.value.status == status and caught.value.code == code
         assert refresh_count == refreshes
         business = [item for item in peer.received if item.path == "/" + operation]
@@ -307,17 +314,12 @@ async def test_late_refresh_does_not_overwrite_login_or_logout(
             store.replace(old if action == "same_login" else latest)
         after_change = store.credentials()
         release.set()
-        if outcome == "rejected" or action == "logout":
-            with pytest.raises(
-                OperationError, check=lambda error: error.code == "invalid_token"
-            ):
-                await task
-        else:
-            assert await task == {}
+        with pytest.raises(
+            OperationError, check=lambda error: error.code == "invalid_token"
+        ):
+            await task
         assert store.credentials() is after_change
-        assert len(peer.received) == (
-            2 if outcome == "rejected" or action == "logout" else 3
-        )
+        assert len(peer.received) == 2
 
 
 @pytest.mark.parametrize(
@@ -361,7 +363,7 @@ async def test_refresh_all_required_fields_and_credentials_preserved(
 
 
 @pytest.mark.parametrize("previous_flight", ["none", "success", "rejected"])
-async def test_changed_snapshot_before_401_uses_latest_without_refresh(
+async def test_new_login_before_401_does_not_replay(
     previous_flight: str,
 ) -> None:
     old, latest = credentials(), credentials()
@@ -398,10 +400,13 @@ async def test_changed_snapshot_before_401_uses_latest_without_refresh(
                 assert await owner.with_session(store).invoke("thing.early", {}) == {}
         store.replace(latest)
         release.set()
-        assert await task == {}
+        with pytest.raises(
+            OperationError, check=lambda error: error.code == "invalid_token"
+        ):
+            await task
         assert (
             len(peer.received)
-            == {"none": 2, "success": 5, "rejected": 4}[previous_flight]
+            == {"none": 1, "success": 4, "rejected": 3}[previous_flight]
         )
         assert sum(item.path == "/auth.refresh" for item in peer.received) == (
             previous_flight != "none"

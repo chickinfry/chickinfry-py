@@ -56,7 +56,13 @@ transport owns the pool: `HttpTransport` closes it with `close()` or `with`, and
 `refresh_expires_at`, `user_id`, and `session_id`. Tokens are hidden from its
 representation. `store.credentials()` returns the current snapshot or `None`;
 `replace(credentials)` installs a login and `clear(expected)` clears only that
-exact snapshot. The first successful `with_session` permanently binds a store
+exact snapshot. A store can start empty. Generated public calls, including
+sign-in and signup, send without credentials from an empty store and use the
+current credentials from an active store. Protected calls from an empty store
+fail locally with `unauthenticated` and no HTTP status. A successful sign-in
+installs the returned credentials, and a successful logout clears the matching
+session.
+The first successful `with_session` permanently binds a store
 to synchronous threads or one asyncio loop. Mixing both transports on that
 store raises `ClientError("failed_precondition")`, including after logout or close.
 Use separate stores for the two modes. Do not concurrently copy the same
@@ -66,6 +72,7 @@ Session transports share one refresh on `invalid_token`/401 and retry at most
 once, using the original request bytes. Other failures are never resent.
 A caller's interrupted or expired wait does not cancel a shared refresh.
 Late refresh responses cannot overwrite a new login or restore a logout.
+A pending request cannot be replayed across a login or logout.
 A refresh failure other than a well-formed 401 preserves credentials and
 blocks further automatic refresh for that snapshot until `replace()` installs
 new credentials. A well-formed 401 clears only the expected snapshot and does

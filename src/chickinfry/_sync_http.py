@@ -25,6 +25,7 @@ from .errors import ClientError, OperationError, _local_error
 from .session import (
     SessionCredentials,
     _Failure,
+    _finish_auth,
     _read_credentials,
     _refresh_candidate,
     _SessionStore,
@@ -146,12 +147,20 @@ class HttpTransport:
     def invoke(self, operation: str, payload: bytes | Mapping[str, object]) -> object:
         return self._invoke(operation, payload, None, None)
 
+    def invoke_public(
+        self, operation: str, payload: bytes | Mapping[str, object]
+    ) -> object:
+        """Invoke an operation declared public by the generated SDK."""
+        return self._invoke(operation, payload, None, None, public=True)
+
     def _invoke(
         self,
         operation: str,
         payload: bytes | Mapping[str, object],
         token: str | None,
         store: _SessionStore | None,
+        *,
+        public: bool = False,
     ) -> object:
         observation = _observer.get()
         if observation is not None:
@@ -169,12 +178,12 @@ class HttpTransport:
         refresh_allowed = True
         if store is not None:
             with store._locked(deadline):
-                snapshot, generation = store._register(deadline)
+                snapshot, generation = store._register(deadline, allow_empty=public)
                 refresh_allowed = store._blocked_generation != generation
-            token = snapshot.access_token
+            token = snapshot.access_token if snapshot is not None else None
         try:
             try:
-                return self._attempt(
+                result = self._attempt(
                     operation,
                     body,
                     None if operation == "auth.refresh" else token,
@@ -195,7 +204,10 @@ class HttpTransport:
                     latest = store._new_credentials(generation)
                 if latest is None:
                     raise failure
-                return self._attempt(operation, body, latest.access_token, deadline)
+                result = self._attempt(operation, body, latest.access_token, deadline)
+            if store is not None:
+                _finish_auth(store, operation, result, snapshot, generation, deadline)
+            return result
         finally:
             if store is not None:
                 store._release(generation)
@@ -525,3 +537,10 @@ class _Authenticated:
 
     def invoke(self, operation: str, payload: bytes | Mapping[str, object]) -> object:
         return self._owner._invoke(operation, payload, self._token, self._store)
+
+    def invoke_public(
+        self, operation: str, payload: bytes | Mapping[str, object]
+    ) -> object:
+        return self._owner._invoke(
+            operation, payload, self._token, self._store, public=True
+        )
