@@ -23,6 +23,7 @@ from .errors import ClientError, OperationError, _local_error
 from .session import (
     SessionCredentials,
     _Failure,
+    _finish_auth,
     _read_credentials,
     _refresh_candidate,
     _SessionStore,
@@ -138,12 +139,20 @@ class AsyncHttpTransport:
     ) -> object:
         return await self._invoke(operation, payload, None, None)
 
+    async def invoke_public(
+        self, operation: str, payload: bytes | Mapping[str, object]
+    ) -> object:
+        """Invoke an operation declared public by the generated SDK."""
+        return await self._invoke(operation, payload, None, None, public=True)
+
     async def _invoke(
         self,
         operation: str,
         payload: bytes | Mapping[str, object],
         token: str | None,
         store: _SessionStore | None,
+        *,
+        public: bool = False,
     ) -> object:
         observation = _observer.get()
         if observation is not None:
@@ -159,15 +168,15 @@ class AsyncHttpTransport:
         refresh_allowed = True
         if store is not None:
             with store._locked():
-                snapshot, generation = store._register()
+                snapshot, generation = store._register(allow_empty=public)
                 refresh_allowed = store._blocked_generation != generation
-            token = snapshot.access_token
+            token = snapshot.access_token if snapshot is not None else None
         timed_out = False
         try:
             try:
                 async with asyncio.timeout_at(deadline):
                     try:
-                        return await self._attempt(
+                        result = await self._attempt(
                             operation,
                             body,
                             None if operation == "auth.refresh" else token,
@@ -190,9 +199,12 @@ class AsyncHttpTransport:
                             latest = store._new_credentials(generation)
                         if latest is None:
                             raise failure
-                        return await self._attempt(
+                        result = await self._attempt(
                             operation, body, latest.access_token, deadline=deadline
                         )
+                    if store is not None:
+                        _finish_auth(store, operation, result, snapshot, generation)
+                    return result
             except TimeoutError:
                 timed_out = True
         finally:
@@ -395,6 +407,13 @@ class _Authenticated:
         self, operation: str, payload: bytes | Mapping[str, object]
     ) -> object:
         return await self._owner._invoke(operation, payload, self._token, self._store)
+
+    async def invoke_public(
+        self, operation: str, payload: bytes | Mapping[str, object]
+    ) -> object:
+        return await self._owner._invoke(
+            operation, payload, self._token, self._store, public=True
+        )
 
 
 async def _read_body(response: "httpx.Response") -> bytes:

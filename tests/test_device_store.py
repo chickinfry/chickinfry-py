@@ -1897,3 +1897,61 @@ def test_device_reason_and_exact_message(code: str, message: str) -> None:
     error = _storage_error(code)
     assert error.code == code and error.status is None
     assert str(error) == message
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    ("fault", "code"),
+    [
+        ("read", "failed_precondition"),
+        ("credentials", "data_loss"),
+        ("outcome", "unauthenticated"),
+    ],
+)
+async def test_unreadable_or_uncertain_store_cannot_start_anonymous_signin(
+    asynchronous: bool,
+    fault: str,
+    code: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handle(request: Received, writer: asyncio.StreamWriter) -> None:
+        await respond(writer)
+
+    async with Peer(handle) as peer:
+        store = store_at(tmp_path / "state", origin=peer.origin)
+        store.replace(credentials())
+        read = store._read
+
+        def read_with_fault(record: _Record) -> dict[str, object]:
+            if fault == "read":
+                raise _storage_error("failed_precondition")
+            state = read(record)
+            if fault == "credentials":
+                current = store._credentials
+                assert current is not None
+                state["session"] = asdict(replace(current, access_token="broken"))
+            else:
+                state["auth_unknown"] = True
+            return read(replace(record, raw=json_bytes(state)))
+
+        if asynchronous:
+            async with AsyncHttpTransport(peer.origin) as owner:
+                transport = owner.with_session(store)
+                monkeypatch.setattr(store, "_read", read_with_fault)
+                with pytest.raises(ClientError) as rejected:
+                    invoke_public = getattr(
+                        transport, "invoke_public", transport.invoke
+                    )
+                    await invoke_public("auth.signin", {})
+        else:
+            with HttpTransport(peer.origin) as sync_owner:
+                sync_transport = sync_owner.with_session(store)
+                monkeypatch.setattr(store, "_read", read_with_fault)
+                with pytest.raises(ClientError) as rejected:
+                    sync_public = getattr(
+                        sync_transport, "invoke_public", sync_transport.invoke
+                    )
+                    await asyncio.to_thread(sync_public, "auth.signin", {})
+        assert rejected.value.code == code and rejected.value.status is None
+        assert not peer.received
