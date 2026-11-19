@@ -426,6 +426,7 @@ def create_worker_entrypoint(
     *,
     _secret_names: tuple[str, ...] = (),
     _vault: bool = False,
+    _storage_names: tuple[str, ...] = (),
 ) -> type[object]: ...
 
 
@@ -436,6 +437,7 @@ def create_worker_entrypoint(
     setup: Callable[[], Awaitable[Options]],
     _secret_names: tuple[str, ...] = (),
     _vault: bool = False,
+    _storage_names: tuple[str, ...] = (),
     _auth_config: str | None = None,
     _auth_hooks: Callable[[Options], "tuple[AuthHooks, Sequence[IdentityProvider]]"]
     | None = None,
@@ -449,6 +451,7 @@ def create_worker_entrypoint(
     setup: Callable[[], Awaitable[Options]] | None = None,
     _secret_names: tuple[str, ...] = (),
     _vault: bool = False,
+    _storage_names: tuple[str, ...] = (),
     _auth_config: str | None = None,
     _auth_hooks: Callable[[Options], "tuple[AuthHooks, Sequence[IdentityProvider]]"]
     | None = None,
@@ -523,7 +526,13 @@ def create_worker_entrypoint(
 
         async def workerd_fetch(self: _Worker, request: _JSRequest) -> object:
             return await _fetch(
-                original, self, request, _secret_names, _vault, _auth_config is not None
+                original,
+                self,
+                request,
+                _secret_names,
+                _vault,
+                auth=_auth_config is not None,
+                storage_names=_storage_names,
             )
 
         return type("Default", (base,), {"fetch": workerd_fetch})

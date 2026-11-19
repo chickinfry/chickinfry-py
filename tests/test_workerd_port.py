@@ -11,6 +11,7 @@ from uuid import UUID
 from packaging.requirements import Requirement
 
 from chickinfry._workerd import (
+    Storage,
     _authenticate,
     _bind_log,
     _fetch,
@@ -23,6 +24,7 @@ from chickinfry._workerd import (
 from chickinfry.auth import AuthHooks, AuthUser
 from chickinfry.orm import DatabasePort
 from chickinfry.postgres import CommitOutcomeUnknown
+from chickinfry.server import OperationError
 
 
 class Bridge:
@@ -159,6 +161,33 @@ class WorkerdPortTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         _request.reset(self.token)
+
+    async def test_named_storage_is_bound_to_the_owning_request(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        async def storage(*args: object) -> bytes | None:
+            calls.append(args)
+            return b"\x00\xff" if args[1] == "get" else None
+
+        self.state.bridge = SimpleNamespace(storage=storage)
+        assets = Storage("assets")
+        await assets.put("probe", b"\x00\xff", "application/octet-stream")
+        self.assertEqual(await assets.get("probe"), b"\x00\xff")
+        self.assertEqual(
+            calls,
+            [
+                (4, "put", "assets", "probe", b"\x00\xff", "application/octet-stream"),
+                (4, "get", "assets", "probe"),
+            ],
+        )
+        token = _request.set(_HostRequest(self.bridge, 5, self.schedule))
+        try:
+            with self.assertRaises(OperationError) as denied:
+                await assets.get("probe")
+            self.assertEqual(denied.exception.code, "service_unavailable")
+        finally:
+            _request.reset(token)
+        self.assertEqual(len(calls), 2)
 
     async def test_saved_logger_is_request_bound_and_stdout_is_buffered(self) -> None:
         saved_log = _bind_log()
@@ -323,7 +352,9 @@ class WorkerdPortTests(unittest.IsolatedAsyncioTestCase):
 
         host = SimpleNamespace(
             verify=lambda python, pyodide: events.append("verify"),
-            prepare=lambda environment, names, vault: events.append("prepare"),
+            prepare=lambda environment, names, vault, storage_names: events.append(
+                "prepare"
+            ),
             start=start,
             finish=finish,
             outputBlocked=lambda: None,
