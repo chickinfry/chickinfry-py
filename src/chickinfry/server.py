@@ -416,6 +416,9 @@ class _SetupFailure:
 @overload
 def create_worker_entrypoint(
     factory: Callable[[object, object], Application[C]],
+    *,
+    _secret_names: tuple[str, ...] = (),
+    _vault: bool = False,
 ) -> type[object]: ...
 
 
@@ -424,6 +427,8 @@ def create_worker_entrypoint(
     factory: Callable[[object, object, Options], Application[C]],
     *,
     setup: Callable[[], Awaitable[Options]],
+    _secret_names: tuple[str, ...] = (),
+    _vault: bool = False,
 ) -> type[object]: ...
 
 
@@ -432,6 +437,8 @@ def create_worker_entrypoint(
     | Callable[[object, object, Options], Application[C]],
     *,
     setup: Callable[[], Awaitable[Options]] | None = None,
+    _secret_names: tuple[str, ...] = (),
+    _vault: bool = False,
 ) -> type[object]:
     """Generated create_application returns a Default class composed with the factory.
 
@@ -489,7 +496,7 @@ def create_worker_entrypoint(
         original = fetch
 
         async def workerd_fetch(self: _Worker, request: _JSRequest) -> object:
-            return await _fetch(original, self, request)
+            return await _fetch(original, self, request, _secret_names, _vault)
 
         return type("Default", (base,), {"fetch": workerd_fetch})
 
