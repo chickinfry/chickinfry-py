@@ -12,8 +12,10 @@ from datetime import date, datetime
 from typing import Any, TypeVar
 from uuid import UUID
 
+from .auth import AuthHooks, AuthUser, IdentityProvider
 from .orm import DatabasePort, format_timestamp
 from .postgres import CommitOutcomeUnknown
+from .server import MAX_REQUEST_BYTES, OperationError, Session, User
 
 T = TypeVar("T")
 _MAX_SAFE = 9007199254740991
@@ -32,6 +34,8 @@ class _HostRequest:
         self.bridge, self.rid = bridge, rid
         self.wait_until = wait_until
         self.closed = False
+        self.business_ready = True
+        self.auth_frame: bytes | None = None
         self.output: dict[str, io.StringIO | None] = {}
 
     def finish(self, cancel: bool = False) -> None:
@@ -252,17 +256,57 @@ def _object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return output
 
 
+def _fields(value: object, keys: set[str]) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError("Invalid host frame.")
+    return value
+
+
+def _text(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("Invalid host frame.")
+    return value
+
+
+def _trusted_session() -> Session | None:
+    state = _request.get()
+    data = state.auth_frame if state is not None and not state.closed else None
+    try:
+        if data is None or len(data) > MAX_REQUEST_BYTES:
+            raise ValueError
+        frame = _fields(
+            json.loads(data.decode("utf-8"), object_pairs_hook=_object), {"auth"}
+        )
+        auth = _fields(frame["auth"], {"version", "session"})
+        if type(auth["version"]) is not int or auth["version"] != 1:
+            raise ValueError
+        if auth["session"] is None:
+            return None
+        session = _fields(auth["session"], {"id", "user"})
+        user = _fields(session["user"], {"id", "email"})
+        return Session(
+            _text(session["id"]), User(_text(user["id"]), _text(user["email"]))
+        )
+    except (ValueError, RecursionError):
+        raise OperationError("operation_failed", 500) from None
+
+
 class _HostPort:
     def __init__(self, _dsn: str | None = None) -> None:
         state = _request.get()
-        if state is None or state.closed:
+        if state is None or state.closed or not state.business_ready:
             raise RuntimeError("An active database request is required.")
         self._state = state
         self._closed = False
         self._lock = asyncio.Lock()
 
     def _check(self) -> None:
-        if self._closed or self._state.closed or _request.get() is not self._state:
+        if (
+            self._closed
+            or self._state.closed
+            or not self._state.business_ready
+            or _request.get() is not self._state
+        ):
             raise RuntimeError("The database request is no longer active.")
 
     async def _call(self, op: str, **fields: object) -> dict[str, Any]:
@@ -400,9 +444,11 @@ class _JSBridge:
 
     async def db(self, frame: bytes) -> bytes:
         # Copy before yielding; no Python buffer is retained across the Promise.
-        data = self.js.Uint8Array.new(self.ffi.to_js(memoryview(frame)))
-        result = await getattr(self.js.globalThis, "__chik").db(data)
+        result = await self.host.db(self.binary(frame))
         return bytes(result.to_py())
+
+    def binary(self, frame: bytes) -> Any:
+        return self.js.Uint8Array.new(self.ffi.to_js(memoryview(frame)))
 
     def finish(self, rid: int, cancel: bool) -> Coroutine[None, None, None]:
         pending = self.host.finish(rid, cancel)
@@ -416,8 +462,161 @@ class _JSBridge:
         return int(self.host.background(rid))
 
     def log(self, rid: int, frame: bytes) -> None:
-        data = self.js.Uint8Array.new(self.ffi.to_js(memoryview(frame)))
-        self.host.log(rid, data)
+        self.host.log(rid, self.binary(frame))
+
+
+class _BorrowedAuthPort:
+    def __init__(self, state: _HostRequest, query: Any) -> None:
+        self._owner = state
+        self._query = query
+        self.active = True
+
+    def _check(self) -> None:
+        if not self.active or self._owner.closed or _request.get() is not self._owner:
+            raise RuntimeError("The transaction is no longer active.")
+
+    async def query(
+        self, sql: str, parameters: Sequence[object]
+    ) -> Sequence[Mapping[str, object]]:
+        self._check()
+        try:
+            frame = json.dumps(
+                {"sql": sql, "params": [_parameter(value) for value in parameters]},
+                allow_nan=False,
+            ).encode()
+            result = await self._query(self._owner.bridge.binary(frame))
+            data = bytes(result.to_py())
+            if len(data) > MAX_REQUEST_BYTES:
+                raise ValueError
+            rows = _fields(json.loads(data, object_pairs_hook=_object), {"rows"})[
+                "rows"
+            ]
+            if not isinstance(rows, list) or any(
+                not isinstance(row, dict) for row in rows
+            ):
+                raise ValueError
+        except Exception:
+            raise _DatabaseFailure() from None
+        self._check()
+        return rows
+
+    async def transaction(self, work: Callable[[DatabasePort], Awaitable[T]]) -> T:
+        raise RuntimeError("Nested transactions are not supported.")
+
+
+async def _authenticate(
+    request: Any,
+    config: str,
+    hooks: AuthHooks,
+    providers: Sequence[IdentityProvider],
+) -> tuple[Any, Any]:
+    from importlib import import_module
+
+    state = _request.get()
+    if state is None or state.closed:
+        raise OperationError("operation_failed", 500)
+    by_id = {provider.id: provider for provider in providers}
+    pending: set[asyncio.Task[Any]] = set()
+    accepting_callbacks = True
+
+    async def call(metadata: str, query: Any = None) -> str | None:
+        if state.closed or not accepting_callbacks:
+            raise RuntimeError("The request is no longer active.")
+        task = asyncio.current_task()
+        if task is not None:
+            pending.add(task)
+        marker = _request.set(state)
+        borrowed = None
+        try:
+            message = json.loads(metadata, object_pairs_hook=_object)
+            if "provider" in message:
+                identity = await by_id[message["provider"]].verify(
+                    message["credential"]
+                )
+                return json.dumps(
+                    {
+                        "subject": identity.subject,
+                        "verifiedEmail": identity.verified_email,
+                    }
+                )
+            message = _fields(message, {"version", "hook", "user"})
+            user = _fields(message["user"], {"id", "email", "createdAt"})
+            actor = AuthUser(
+                _text(user["id"]), _text(user["email"]), _text(user["createdAt"])
+            )
+            if (
+                message["version"] == 1
+                and message["hook"] == "userCreating"
+                and hooks.user_creating
+                and query is not None
+            ):
+                borrowed = _BorrowedAuthPort(state, query)
+                await hooks.user_creating(borrowed, actor)
+            elif (
+                message["version"] == 1
+                and message["hook"] == "userCreated"
+                and hooks.user_created
+            ):
+                await hooks.user_created(actor)
+            else:
+                raise ValueError("Invalid host hook.")
+            return None
+        finally:
+            if borrowed is not None:
+                borrowed.active = False
+            _request.reset(marker)
+            if task is not None:
+                pending.discard(task)
+
+    bridge = state.bridge
+    callback = bridge.ffi.create_proxy(call)
+    workers = import_module("workers")
+    try:
+        result = await bridge.host.authenticate(
+            state.rid,
+            request.js_object,
+            config,
+            json.dumps(list(by_id)),
+            hooks.user_creating is not None,
+            hooks.user_created is not None,
+            callback,
+        )
+        response = getattr(result, "response", None)
+        if response is not None:
+            return workers.Response(response), request
+        frame = getattr(result, "frame", None)
+        state.auth_frame = bytes(frame.to_py()) if frame is not None else None
+        _trusted_session()
+        state.business_ready = True
+        return None, workers.Request(result.request)
+    except asyncio.CancelledError:
+        bridge.host.cancelAuth(state.rid)
+        raise
+    except Exception:
+        return workers.Response(
+            '{"error":"operation_failed"}',
+            status=500,
+            headers={
+                "content-type": "application/json",
+                "cache-control": "no-store",
+            },
+        ), request
+    finally:
+        accepting_callbacks = False
+        active = tuple(pending)
+        remaining = len(active)
+        if remaining == 0:
+            callback.destroy()
+
+        def retire(_: asyncio.Task[Any]) -> None:
+            nonlocal remaining
+            remaining -= 1
+            if remaining == 0:
+                callback.destroy()
+
+        for task in active:
+            task.add_done_callback(retire)
+            task.cancel()
 
 
 async def _fetch(
@@ -426,6 +625,7 @@ async def _fetch(
     request: Any,
     secret_names: tuple[str, ...] = (),
     vault: bool = False,
+    auth: bool = False,
 ) -> object:
     global _output_blocked, _unscoped_output
     from importlib import import_module
@@ -444,9 +644,12 @@ async def _fetch(
         _report_blocked_output()
     state = _HostRequest(
         _JSBridge(host, ffi, js),
-        host.start(request.js_object.signal, request.js_object.headers),
+        host.start(request.js_object.signal, request.js_object.headers, True)
+        if auth
+        else host.start(request.js_object.signal, request.js_object.headers),
         worker.ctx.waitUntil,
     )
+    state.business_ready = not auth
     marker = _request.set(state)
     try:
         return await fetch(worker, request)

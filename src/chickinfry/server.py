@@ -9,15 +9,25 @@ import asyncio
 import json
 import re
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from importlib import import_module
 from types import MappingProxyType
-from typing import Generic, Protocol, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar, cast, overload
 from urllib.parse import urlsplit
 
 from ._error_details import FieldError as FieldError
 from ._error_details import _fields, _message, _string
+
+if TYPE_CHECKING:
+    from .auth import AuthHooks, IdentityProvider
 
 Input = TypeVar("Input")
 Output = TypeVar("Output")
@@ -47,15 +57,12 @@ class OperationError(Exception):
 class User:
     id: str
     email: str
-    # No email_verified_at column; switch to the column's value when it is introduced.
-    email_verified: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class Session:
     id: str
     user: User
-    expires_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,6 +436,9 @@ def create_worker_entrypoint(
     setup: Callable[[], Awaitable[Options]],
     _secret_names: tuple[str, ...] = (),
     _vault: bool = False,
+    _auth_config: str | None = None,
+    _auth_hooks: Callable[[Options], "tuple[AuthHooks, Sequence[IdentityProvider]]"]
+    | None = None,
 ) -> type[object]: ...
 
 
@@ -439,6 +449,9 @@ def create_worker_entrypoint(
     setup: Callable[[], Awaitable[Options]] | None = None,
     _secret_names: tuple[str, ...] = (),
     _vault: bool = False,
+    _auth_config: str | None = None,
+    _auth_hooks: Callable[[Options], "tuple[AuthHooks, Sequence[IdentityProvider]]"]
+    | None = None,
 ) -> type[object]:
     """Generated create_application returns a Default class composed with the factory.
 
@@ -480,6 +493,19 @@ def create_worker_entrypoint(
                 if options.cancelled:
                     raise asyncio.CancelledError from None
                 raise RuntimeError("Application setup failed.") from None
+            if (
+                sys.platform == "emscripten"
+                and _auth_config is not None
+                and _auth_hooks is not None
+            ):
+                from ._workerd import _authenticate
+
+                hooks, providers = _auth_hooks(options)
+                response, request = await _authenticate(
+                    request, _auth_config, hooks, providers
+                )
+                if response is not None:
+                    return response
             application = cast(
                 Callable[[object, object, Options], Application[C]], factory
             )(environment, self.ctx, options)
@@ -496,7 +522,9 @@ def create_worker_entrypoint(
         original = fetch
 
         async def workerd_fetch(self: _Worker, request: _JSRequest) -> object:
-            return await _fetch(original, self, request, _secret_names, _vault)
+            return await _fetch(
+                original, self, request, _secret_names, _vault, _auth_config is not None
+            )
 
         return type("Default", (base,), {"fetch": workerd_fetch})
 
