@@ -112,7 +112,7 @@ async def test_auth_context_dispatch(
             if credential == "database_failure":
                 await port.close()
             session = (
-                await Auth(port, create_database, now=db.now).session(token)
+                (await Auth(port, create_database, now=db.now).session(token)).session
                 if token is not None
                 else None
             )
@@ -132,7 +132,6 @@ async def test_auth_context_dispatch(
         calls.append("protected")
         assert ctx.auth.session.id == tokens.session_id
         assert ctx.auth.session.user.id == tokens.user_id
-        assert ctx.auth.session.expires_at == tokens.expires_at
         await ctx.db.insert({"label": ctx.auth.session.user.id})
         return ctx.auth.session.user.email
 

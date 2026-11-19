@@ -177,6 +177,12 @@ class AuthUser:
     created_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class _SessionResult:
+    session: Session
+    expires_at: str
+
+
 class TokensWire(TypedDict):
     access_token: str
     refresh_token: str
@@ -598,7 +604,7 @@ class Auth:
 
     async def _validate_session(
         self, db: AuthDatabase, record: SessionRecord | None
-    ) -> Session:
+    ) -> _SessionResult:
         if (
             record is None
             or record.transport != "native"
@@ -615,16 +621,15 @@ class Auth:
             or family <= instant
         ):
             raise OperationError("invalid_token", 401)
-        return Session(
-            record.id,
-            User(user.id, user.email),
+        return _SessionResult(
+            Session(record.id, User(user.id, user.email)),
             format_timestamp(min(parse_timestamp(record.expires_at), family)),
         )
 
-    async def session(self, access_token: str) -> Session:
+    async def session(self, access_token: str) -> _SessionResult:
         _validate_token(access_token)
 
-        async def read(port: DatabasePort) -> Session:
+        async def read(port: DatabasePort) -> _SessionResult:
             db = self.create_database(port)
             record = await self._lock_session(db, access_token)
             return await self._validate_session(db, record)
@@ -650,7 +655,7 @@ class Auth:
         )
 
     async def logout(self, access_token: str) -> None:
-        session = await self.session(access_token)
+        session = (await self.session(access_token)).session
         await self.db.sessions.update_if(
             {"id": session.id},
             _filter(self.db.sessions, "revoked_at", "is null"),
@@ -827,7 +832,7 @@ class Auth:
         async def run(port: DatabasePort) -> T:
             db = self.create_database(port)
             session = await self._lock_session(db, access)
-            actor = await self._validate_session(db, session)
+            actor = (await self._validate_session(db, session)).session
             if self.hooks.invite_managing is None:
                 raise OperationError("permission_denied", 403)
             if self.project_id is None:

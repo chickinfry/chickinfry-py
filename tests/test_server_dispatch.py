@@ -16,7 +16,7 @@ import pytest
 
 from chickinfry import AsyncHttpTransport, HttpTransport
 from chickinfry._auth_database import Database, create_database
-from chickinfry.auth import Auth
+from chickinfry.auth import Auth, _SessionResult
 from chickinfry.errors import OperationError as ReceivedOperationError
 from chickinfry.orm import format_timestamp, parse_timestamp
 from chickinfry.server import (
@@ -27,7 +27,6 @@ from chickinfry.server import (
     Request,
     RequestInfo,
     RequestScope,
-    Session,
     _Body,
     _Bytes,
     _HostRequest,
@@ -43,7 +42,7 @@ from .server_fixture import Harness, records
 
 @dataclass(frozen=True, slots=True, repr=False)
 class _Scope:
-    session: Session | None = None
+    session: _SessionResult | None = None
 
 
 @dataclass
@@ -594,16 +593,16 @@ async def test_auth_session_effective_expiry(
 
         return RequestScope(_Scope(session=await core.session(token)), close)
 
-    async def session(context: _Scope, value: Mapping[str, object]) -> Session:
+    async def session(context: _Scope, value: Mapping[str, object]) -> _SessionResult:
         if context.session is None:
             raise OperationError("unauthenticated", 401)
         return context.session
 
-    def encode_session(value: Session) -> Mapping[str, object]:
+    def encode_session(value: _SessionResult) -> Mapping[str, object]:
         return {
-            "id": value.user.id,
-            "email": value.user.email,
-            "session_id": value.id,
+            "id": value.session.user.id,
+            "email": value.session.user.email,
+            "session_id": value.session.id,
             "expires_at": value.expires_at,
         }
 

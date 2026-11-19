@@ -116,12 +116,11 @@ async def test_tokens_expiry_and_logout(db: Harness) -> None:
     assert refresh.created_at == format_timestamp(started)
     assert parse_timestamp(initial.refresh_expires_at) == started + timedelta(days=30)
     actor = await core.session(initial.access_token)
-    assert type(actor.user.email_verified) is bool
-    assert actor.user.email_verified is False
+    assert actor.expires_at == initial.expires_at
     assert (
-        actor.id == initial.session_id
-        and actor.user.id == initial.user_id
-        and actor.id != actor.user.id
+        actor.session.id == initial.session_id
+        and actor.session.user.id == initial.user_id
+        and actor.session.id != actor.session.user.id
     )
     db.instant += timedelta(seconds=899)
     assert await core.session(initial.access_token) == actor
@@ -1077,7 +1076,7 @@ async def test_legacy_idle_uses_latest_successful_issue(
     with pytest.raises(OperationError):
         await core.refresh(random_token())
     if offset < 0:
-        assert (await core.session(tokens.access_token)).id == tokens.session_id
+        assert (await core.session(tokens.access_token)).session.id == tokens.session_id
         rotated = await core.refresh(tokens.refresh_token)
         assert parse_timestamp(rotated.refresh_expires_at) == db.now() + timedelta(
             seconds=3600

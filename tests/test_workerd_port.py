@@ -11,6 +11,7 @@ from uuid import UUID
 from packaging.requirements import Requirement
 
 from chickinfry._workerd import (
+    _authenticate,
     _bind_log,
     _fetch,
     _HostPort,
@@ -19,6 +20,7 @@ from chickinfry._workerd import (
     _request,
     _wait_until,
 )
+from chickinfry.auth import AuthHooks, AuthUser
 from chickinfry.orm import DatabasePort
 from chickinfry.postgres import CommitOutcomeUnknown
 
@@ -57,6 +59,94 @@ class Bridge:
 
 
 class WorkerdPortTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_stops_host_before_releasing_active_hook_callback(
+        self,
+    ) -> None:
+        started = asyncio.Event()
+        released = asyncio.Event()
+        events: list[str] = []
+        hooks: list[asyncio.Task[object]] = []
+
+        async def creating(port: DatabasePort, user: AuthUser) -> None:
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                events.append("hook settled")
+
+        async def authenticate(*args: Any) -> None:
+            callback = args[-1]
+            hooks.append(
+                asyncio.create_task(
+                    callback.call(
+                        '{"version":1,"hook":"userCreating","user":{"id":"u","email":"e","createdAt":"t"}}',
+                        object(),
+                    )
+                )
+            )
+            await asyncio.Future()
+
+        def release() -> None:
+            events.append("proxy released")
+            released.set()
+
+        self.state.bridge = SimpleNamespace(
+            ffi=SimpleNamespace(
+                create_proxy=lambda call: SimpleNamespace(
+                    call=call,
+                    destroy=release,
+                )
+            ),
+            host=SimpleNamespace(
+                authenticate=authenticate,
+                cancelAuth=lambda rid: events.append("host stopped"),
+            ),
+        )
+        with patch("importlib.import_module", return_value=SimpleNamespace()):
+            dispatch = asyncio.create_task(
+                _authenticate(
+                    SimpleNamespace(js_object=object()),
+                    "{}",
+                    AuthHooks(user_creating=creating),
+                    (),
+                )
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            dispatch.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await dispatch
+            await asyncio.gather(*hooks, return_exceptions=True)
+            await asyncio.wait_for(released.wait(), timeout=1)
+
+        self.assertEqual(events, ["host stopped", "hook settled", "proxy released"])
+
+    async def test_trusted_frame_validates_before_exposing_a_business_session(
+        self,
+    ) -> None:
+        from chickinfry._workerd import _trusted_session
+        from chickinfry.server import OperationError, Session, User
+
+        for invalid in (
+            None,
+            b'{"auth":{"version":true,"session":null}}',
+            b'{"auth":{"version":1,"session":null,"session":null}}',
+            b'{"auth":{"version":1,"session":{"id":"s","user":{"id":"u","email":"e"},"emailVerified":true}}}',
+        ):
+            self.state.auth_frame = invalid
+            with self.assertRaises(OperationError) as error:
+                _trusted_session()
+            self.assertEqual(
+                (error.exception.status, error.exception.code),
+                (500, "operation_failed"),
+            )
+
+        self.state.auth_frame = b'{"auth":{"version":1,"session":null}}'
+        self.assertIsNone(_trusted_session())
+        self.state.auth_frame = (
+            b'{"auth":{"version":1,"session":{"id":"s","user":{"id":"u","email":"e"}}}}'
+        )
+        self.assertEqual(_trusted_session(), Session("s", User("u", "e")))
+
     async def asyncSetUp(self) -> None:
         self.bridge = Bridge()
         self.finishing: list[asyncio.Future[None]] = []
