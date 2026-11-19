@@ -10,7 +10,15 @@ from uuid import UUID
 
 from packaging.requirements import Requirement
 
-from chickinfry._workerd import _fetch, _HostPort, _HostRequest, _request
+from chickinfry._workerd import (
+    _bind_log,
+    _fetch,
+    _HostPort,
+    _HostRequest,
+    _LogStream,
+    _request,
+    _wait_until,
+)
 from chickinfry.orm import DatabasePort
 from chickinfry.postgres import CommitOutcomeUnknown
 
@@ -20,6 +28,16 @@ class Bridge:
         self.calls: list[dict[str, Any]] = []
         self.error: dict[str, str] | None = None
         self.finished: list[tuple[int, bool]] = []
+        self.logs: list[dict[str, object]] = []
+
+    def log(self, rid: int, frame: bytes) -> None:
+        record = json.loads(frame)
+        assert record["rid"] == rid
+        self.logs.append(record)
+
+    def background(self, rid: int) -> int:
+        assert rid == 4
+        return 5
 
     async def db(self, frame: bytes) -> bytes:
         call = json.loads(frame)
@@ -41,12 +59,43 @@ class Bridge:
 class WorkerdPortTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.bridge = Bridge()
-        self.state = _HostRequest(self.bridge, 4)
+        self.finishing: list[asyncio.Future[None]] = []
+        self.state = _HostRequest(self.bridge, 4, self.schedule)
         self.token = _request.set(self.state)
         self.port = _HostPort()
 
+    def schedule(self, work: Any) -> None:
+        self.finishing.append(asyncio.ensure_future(work))
+
     async def asyncTearDown(self) -> None:
         _request.reset(self.token)
+
+    async def test_saved_logger_is_request_bound_and_stdout_is_buffered(self) -> None:
+        saved_log = _bind_log()
+        print("first", end="", file=_LogStream("info"))
+        print("\nsecond", file=_LogStream("info"))
+        token = _request.set(_HostRequest(self.bridge, 5, self.schedule))
+        try:
+            saved_log("info", "wrong request", None)
+        finally:
+            _request.reset(token)
+        self.state.finish()
+        saved_log("info", "closed request", None)
+        await asyncio.gather(*self.finishing)
+        self.assertEqual(
+            self.bridge.logs, [{"rid": 4, "level": "info", "message": "first\nsecond"}]
+        )
+
+    async def test_auth_background_owns_a_separate_host_request(self) -> None:
+        async def cleanup() -> None:
+            await _HostPort().query("select 1", [])
+
+        _wait_until(cleanup())
+        self.state.finish()
+        await self.finishing[0]
+        await asyncio.gather(*self.finishing[1:])
+        self.assertEqual([frame["rid"] for frame in self.bridge.calls], [5])
+        self.assertCountEqual(self.bridge.finished, [(4, False), (5, False)])
 
     async def test_frame_values_and_transaction_lifetime(self) -> None:
         stamp = datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=timezone.utc)
@@ -118,7 +167,7 @@ class WorkerdPortTests(unittest.IsolatedAsyncioTestCase):
         for value in [2**53, float("nan"), float("inf")]:
             with self.assertRaises(ValueError):
                 await self.port.query("select $1", [value])
-        token = _request.set(_HostRequest(self.bridge, 5))
+        token = _request.set(_HostRequest(self.bridge, 5, self.schedule))
         try:
             with self.assertRaises(RuntimeError):
                 await self.port.query("select 1", [])
@@ -133,6 +182,7 @@ class WorkerdPortTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.bridge, "db", cancelled):
             with self.assertRaises(asyncio.CancelledError):
                 await self.port.query("select 1", [])
+        await asyncio.gather(*self.finishing)
         self.assertEqual(self.bridge.finished, [(4, True)])
 
     async def test_callback_cancellation_closes_host_without_rollback(self) -> None:
@@ -141,6 +191,7 @@ class WorkerdPortTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(asyncio.CancelledError):
             await self.port.transaction(cancel)
+        await asyncio.gather(*self.finishing)
         self.assertEqual([x["op"] for x in self.bridge.calls], ["begin"])
         self.assertEqual(self.bridge.finished, [(4, True)])
 
@@ -163,33 +214,46 @@ class WorkerdPortTests(unittest.IsolatedAsyncioTestCase):
             driver.marker.evaluate({"extra": "server", "sys_platform": "linux"})
         )
 
-    async def test_sdk_request_signal_bootstraps_before_dispatch(self) -> None:
-        signal, response = object(), object()
+    async def test_sdk_returns_before_host_cleanup_and_finishes_once(self) -> None:
+        signal, headers, response = object(), object(), object()
         events: list[str] = []
+        release = asyncio.Event()
+        finished: list[asyncio.Task[None]] = []
 
-        def start(value: object) -> int:
+        def start(value: object, incoming_headers: object) -> int:
             self.assertIs(value, signal)
+            self.assertIs(incoming_headers, headers)
             events.append("start")
             return 11
 
         async def finish(rid: int, cancel: bool) -> None:
             self.assertEqual((rid, cancel), (11, False))
             events.append("finish")
+            await release.wait()
 
         host = SimpleNamespace(
             verify=lambda python, pyodide: events.append("verify"),
-            prepare=lambda environment: events.append("prepare"),
+            prepare=lambda environment, names, vault: events.append("prepare"),
             start=start,
             finish=finish,
+            outputBlocked=lambda: None,
         )
         modules = {
             "workers": SimpleNamespace(import_from_javascript=lambda name: host),
-            "pyodide.ffi": SimpleNamespace(),
+            "pyodide.ffi": SimpleNamespace(to_js=lambda value: value),
             "js": SimpleNamespace(),
             "pyodide": SimpleNamespace(__version__="314.0.6"),
         }
-        worker = SimpleNamespace(env=object())
-        request = SimpleNamespace(js_object=SimpleNamespace(signal=signal))
+
+        def wait_until(work: Any) -> None:
+            finished.append(asyncio.create_task(work))
+
+        worker = SimpleNamespace(
+            env=object(), ctx=SimpleNamespace(waitUntil=wait_until)
+        )
+        request = SimpleNamespace(
+            js_object=SimpleNamespace(signal=signal, headers=headers)
+        )
 
         async def dispatch(instance: object, incoming: object) -> object:
             self.assertIs(instance, worker)
@@ -200,7 +264,16 @@ class WorkerdPortTests(unittest.IsolatedAsyncioTestCase):
             events.append("dispatch")
             return response
 
-        with patch("importlib.import_module", side_effect=modules.__getitem__):
-            self.assertIs(await _fetch(dispatch, worker, request), response)
+        with (
+            patch("chickinfry._workerd._output_blocked", None),
+            patch("importlib.import_module", side_effect=modules.__getitem__),
+        ):
+            self.assertIs(
+                await asyncio.wait_for(_fetch(dispatch, worker, request), 1), response
+            )
+        self.assertEqual(len(finished), 1)
+        self.assertFalse(finished[0].done())
+        release.set()
+        await finished[0]
         self.assertEqual(events, ["verify", "prepare", "start", "dispatch", "finish"])
         self.assertIs(_request.get(), self.state)
