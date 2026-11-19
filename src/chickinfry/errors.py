@@ -13,6 +13,7 @@ _MESSAGES = {
     "data_loss": "Stored session data could not be read; sign out to clear it, then sign in again.",
     "unimplemented": "This client does not support Python Workers yet (support is planned); make calls from a regular Python process for now.",
     "internal": "The server response is invalid; check that the server and generated client use the same API contract.",
+    "permission_denied": "The session is not authorized for this channel; check the channel permission before subscribing again.",
     "unknown": "The client failed for an unknown reason; check the client's configuration and the server's state before making another call.",
     "unauthenticated": "The request has no eligible session; use an active session for this operation.",
     "operation_failed": "The operation failed; check the error code and HTTP status, then resolve the reported problem before making another call.",

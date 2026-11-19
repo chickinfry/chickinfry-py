@@ -227,6 +227,8 @@ class AsyncHttpTransport:
             if flight is None:
                 if not store._current(snapshot, generation):
                     return
+                if store._blocked_generation == generation:
+                    raise ClientError("unauthenticated")
         elected = flight is None
         if flight is None:
             flight = asyncio.create_task(

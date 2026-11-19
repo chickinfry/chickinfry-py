@@ -21,3 +21,4 @@ ruff==0.17.0
 tomlkit==0.15.1
 trove-classifiers==2026.9.21.13
 typing-extensions==4.16.0
+websockets==16.0

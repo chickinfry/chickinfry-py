@@ -1,0 +1,177 @@
+{
+  "protocolVersion": 2,
+  "driverVersion": "1.0.0",
+  "driverCommit": "1211dec372cd7f51f42b075735089ed8aff91109",
+  "build": null,
+  "executable": "",
+  "run": {
+    "entry": "conformance/driver/main.py"
+  },
+  "files": [
+    {
+      "path": "conformance/driver/credentials.py",
+      "sha256": "10a146b378c824e4d238d787a675e6eaff3f372380d621a9c044028aa7a4fa75"
+    },
+    {
+      "path": "conformance/driver/main.py",
+      "sha256": "a0eae0a676c205896f5382449803159e5833b2202cf91e4c2d08cc9bee19e99e"
+    },
+    {
+      "path": "conformance/driver/realtime_trial.py",
+      "sha256": "bf0fa98537647c923e913bfa47ad32430da6d8f71915d85ea858ee18167c8940"
+    },
+    {
+      "path": "conformance/driver/transport.py",
+      "sha256": "30da868b4ac8448499f91ce7c640f264fa417bba5ee7f555a4152ca496cd35ff"
+    },
+    {
+      "path": "pyproject.toml",
+      "sha256": "80fdb657934c3bc0d03512b653bd361eeb405abcdf24cbd06565fc66f25ecac3"
+    },
+    {
+      "path": "requirements-dev.txt",
+      "sha256": "acdccbab0e9d8448be6f152650acb6aff89078b16284fec90388d971370938be"
+    },
+    {
+      "path": "requirements.txt",
+      "sha256": "f68b13b328634c81af711dd4b69cfa5fbeed169f865ca89aed8a5764abd5822b"
+    },
+    {
+      "path": "src/chickinfry/__init__.py",
+      "sha256": "4dfd67e478805f7ac5e99bc0ff75bfa920544cc61a15d2cdddcfbeb665b45297"
+    },
+    {
+      "path": "src/chickinfry/_auth_database.py",
+      "sha256": "e41f6a19cfd7eb2c14d286598888cd1dd5afc9091480c71ea40188f73d3171ce"
+    },
+    {
+      "path": "src/chickinfry/_conformance.py",
+      "sha256": "ae9322c9fe05331fde6155d12b573ed8410f1227b4a21dfeaa804bcd915c42e7"
+    },
+    {
+      "path": "src/chickinfry/_device.py",
+      "sha256": "7d4a56049f322b0cadf94c3be21b43557409394a3e944853de1bcf48e18bbb2d"
+    },
+    {
+      "path": "src/chickinfry/_device_windows.py",
+      "sha256": "bf6560d8f59248125d28a3bb757ad618f697390dfb7f215b18a0f0754dda092c"
+    },
+    {
+      "path": "src/chickinfry/_error_details.py",
+      "sha256": "ca98e9b28cd97e6bec0d5745e87f1b85f6ac73523f3c22cb2d0bfca0f262191c"
+    },
+    {
+      "path": "src/chickinfry/_http_common.py",
+      "sha256": "af2abdf9303a56484a460a2a38f04ec26ff9c9e85058986b7814f40c95c57542"
+    },
+    {
+      "path": "src/chickinfry/_input.py",
+      "sha256": "de2e324e1b6298dc0d5310c10be40f70d4474694b05c6db61a20506d9ae73bc0"
+    },
+    {
+      "path": "src/chickinfry/_origin.py",
+      "sha256": "326ca986dae06076718adcbede0f20224f7213818430d2694d23b267235178a4"
+    },
+    {
+      "path": "src/chickinfry/_password.py",
+      "sha256": "71a8fa7df5f875058752e7674e7a624de24213431c4dbf77b31483aa66ffae13"
+    },
+    {
+      "path": "src/chickinfry/_request_logs.py",
+      "sha256": "85a8cdb579de7f3fbb40bc91f7b04aef0adfb09554e287ea7656ae3deaceae6c"
+    },
+    {
+      "path": "src/chickinfry/_request_state.py",
+      "sha256": "e0b7dc2d11a1b1a6a3596e4ef762deb33ccb8008fd658714c60cd1ed05c79ee0"
+    },
+    {
+      "path": "src/chickinfry/_sync_http.py",
+      "sha256": "c27ef2be6ea515ad2577c214280929da92273ba65a2c77a13d43f9fd5e7a1613"
+    },
+    {
+      "path": "src/chickinfry/_sync_network.py",
+      "sha256": "d9a040a70f35e631665f834b55d14a311aa181132212811d8b2385347890ab15"
+    },
+    {
+      "path": "src/chickinfry/_workerd.py",
+      "sha256": "12411ba8546ef7a349ec37bb52f63832d853bd6cc3ab3202dc20120b2f72bd56"
+    },
+    {
+      "path": "src/chickinfry/auth.py",
+      "sha256": "ce6bc25d2be1552835d111ba789410da634e3cd038b7b7f1756e2d606bd926a7"
+    },
+    {
+      "path": "src/chickinfry/errors.py",
+      "sha256": "5ebf35143283a4bf1e3300dd3796d09ddb0623b9b8c3f9d3b797e30c434270e7"
+    },
+    {
+      "path": "src/chickinfry/http.py",
+      "sha256": "4e7755e525295f0c4cc1455d1db9b3246ffc65636a173fa1e7e02c52675024e3"
+    },
+    {
+      "path": "src/chickinfry/orm.py",
+      "sha256": "699ba3c90e956db6ca6d9883be07536bb652d34824270cddf6a1571dad548103"
+    },
+    {
+      "path": "src/chickinfry/postgres.py",
+      "sha256": "129ecae8136e185488d25af2f633167cfb0abafda3206c9e340f2d4a1416ff18"
+    },
+    {
+      "path": "src/chickinfry/py.typed",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/chickinfry/realtime.py",
+      "sha256": "14751527ac156d33bfe072435216906dcb5f70be3bdbf6c479d109eee9874a53"
+    },
+    {
+      "path": "src/chickinfry/server.py",
+      "sha256": "e93a18e6c4dcfee5595bd733d307694b8231ce8aabb9efe8e6ab7a3489a5aa12"
+    },
+    {
+      "path": "src/chickinfry/session.py",
+      "sha256": "087ac3e7fea5b006b80073fff1256b333f608cb3da9bcea7e511b48fe27a5368"
+    },
+    {
+      "path": "src/chickinfry/signup.py",
+      "sha256": "62169277ae9dd84d2884c268b9c094c7543a3dc2a38a256f9e6c1a3782a96966"
+    },
+    {
+      "path": "src/chickinfry/wire.py",
+      "sha256": "46ef50c9b61b88968a49c33293601a4656519582486089b7767f567cae384a5c"
+    },
+    {
+      "path": "wheelhouse/anyio-4.15.1-py3-none-any.whl",
+      "sha256": "6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101"
+    },
+    {
+      "path": "wheelhouse/certifi-2026.7.22-py3-none-any.whl",
+      "sha256": "62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775"
+    },
+    {
+      "path": "wheelhouse/h11-0.16.0-py3-none-any.whl",
+      "sha256": "63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86"
+    },
+    {
+      "path": "wheelhouse/httpcore-1.0.9-py3-none-any.whl",
+      "sha256": "2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55"
+    },
+    {
+      "path": "wheelhouse/httpx-0.28.1-py3-none-any.whl",
+      "sha256": "d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad"
+    },
+    {
+      "path": "wheelhouse/idna-3.20-py3-none-any.whl",
+      "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c"
+    },
+    {
+      "path": "wheelhouse/typing_extensions-4.16.0-py3-none-any.whl",
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"
+    },
+    {
+      "path": "wheelhouse/websockets-16.0-py3-none-any.whl",
+      "sha256": "1637db62fad1dc833276dded54215f2c7fa46912301a24bd94d45d46a011ceec"
+    }
+  ],
+  "requiredAuthSDK": true
+}
