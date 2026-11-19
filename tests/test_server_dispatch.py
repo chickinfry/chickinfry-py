@@ -862,16 +862,32 @@ async def test_workers_entry_admits_only_safe_request_headers(
     if not uses_auth:
         assert all(info.headers[key] == "dummy" for key in ("authorization", "cookie"))
     assert info.headers["x-custom"] == "dummy"
-    assert info.method == source.method and info.url == source.url
-    assert not any(hasattr(info, name) for name in ("source", "body", "env", "ctx"))
+    assert info.method == source.method and info.path == "/probe.echo"
+    assert not any(
+        hasattr(info, name) for name in ("url", "source", "body", "env", "ctx")
+    )
+
+
+@pytest.mark.parametrize(
+    ("url", "path"),
+    [
+        ("https://example.test/items/a%2Fb?view=full#detail", "/items/a%2Fb"),
+        ("https://example.test", "/"),
+    ],
+)
+def test_request_info_extracts_only_the_path(url: str, path: str) -> None:
+    assert (
+        RequestInfo.from_request(BytesRequest([], url=url), uses_auth=False).path
+        == path
+    )
 
 
 def test_request_info_copies_and_freezes_metadata() -> None:
     headers = {"X-Custom": "original", "PrOxY-AuThOrIzAtIoN": "dummy"}
-    info = RequestInfo("POST", "https://example.test/probe.echo", headers)
+    info = RequestInfo("POST", path="/probe.echo", headers=headers)
     headers["X-Custom"] = "changed"
     assert dict(info.headers) == {"x-custom": "original"}
-    assert "original" not in repr(info) and "example.test" not in repr(info)
+    assert "original" not in repr(info) and "/probe.echo" not in repr(info)
     with pytest.raises(TypeError):
         cast(dict[str, str], info.headers)["x-custom"] = "changed"
 
