@@ -1,4 +1,5 @@
 import asyncio
+import builtins
 import io
 import json
 import logging
@@ -438,6 +439,39 @@ class _Transaction:
         raise RuntimeError("Nested transactions are not supported.")
 
 
+class Storage:
+    """A declared file store for the current request."""
+
+    __slots__ = ("_name", "_owner")
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._owner = _request.get()
+
+    def _active_request(self) -> _HostRequest:
+        owner = self._owner
+        if owner is None or owner.closed or _request.get() is not owner:
+            raise OperationError("service_unavailable", 503)
+        return owner
+
+    async def get(self, key: str) -> bytes | None:
+        """Read an object as bytes, returning None when the key is absent."""
+        owner = self._active_request()
+        result: bytes | None = await owner.bridge.storage(
+            owner.rid, "get", self._name, key
+        )
+        return result
+
+    async def put(self, key: str, bytes: builtins.bytes, content_type: str) -> None:
+        """Write bytes with the supplied media type."""
+        owner = self._active_request()
+        if type(bytes) is not builtins.bytes or len(bytes) > 4 << 20:
+            raise OperationError("operation_failed", 500)
+        await owner.bridge.storage(
+            owner.rid, "put", self._name, key, bytes, content_type
+        )
+
+
 class _JSBridge:
     def __init__(self, host: Any, ffi: Any, js: Any) -> None:
         self.host, self.ffi, self.js = host, ffi, js
@@ -449,6 +483,37 @@ class _JSBridge:
 
     def binary(self, frame: bytes) -> Any:
         return self.js.Uint8Array.new(self.ffi.to_js(memoryview(frame)))
+
+    async def storage(
+        self,
+        rid: int,
+        operation: str,
+        name: str,
+        key: str,
+        data: bytes | None = None,
+        content_type: str | None = None,
+    ) -> bytes | None:
+        if type(key) is not str or (
+            operation == "put" and type(content_type) is not str
+        ):
+            raise OperationError("operation_failed", 500)
+        try:
+            payload = None if data is None else self.binary(data)
+            result = await self.host.storage(
+                rid, operation, name, key, payload, content_type
+            )
+            error = getattr(result, "error", None)
+            if error == "service_unavailable":
+                raise OperationError("service_unavailable", 503)
+            if error is None:
+                if operation == "put" or result.value is self.ffi.jsnull:
+                    return None
+                return bytes(result.value.to_py())
+        except OperationError:
+            raise
+        except Exception:
+            pass
+        raise OperationError("operation_failed", 500)
 
     def finish(self, rid: int, cancel: bool) -> Coroutine[None, None, None]:
         pending = self.host.finish(rid, cancel)
@@ -626,6 +691,7 @@ async def _fetch(
     secret_names: tuple[str, ...] = (),
     vault: bool = False,
     auth: bool = False,
+    storage_names: tuple[str, ...] = (),
 ) -> object:
     global _output_blocked, _unscoped_output
     from importlib import import_module
@@ -636,7 +702,9 @@ async def _fetch(
     host = workers.import_from_javascript("_chik/host.js")
     pyodide = import_module("pyodide")
     host.verify(sys.version.split()[0], pyodide.__version__)
-    host.prepare(worker.env, ffi.to_js(list(secret_names)), vault)
+    host.prepare(
+        worker.env, ffi.to_js(list(secret_names)), vault, ffi.to_js(list(storage_names))
+    )
     if _output_blocked is None:
         _output_blocked = host.outputBlocked
     if _unscoped_output:
