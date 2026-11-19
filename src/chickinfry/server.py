@@ -79,7 +79,7 @@ class RequestInfo:
     """Immutable request metadata, without a body reader or host references."""
 
     method: str
-    url: str
+    path: str
     headers: Mapping[str, str]
 
     def __post_init__(self) -> None:
@@ -99,7 +99,7 @@ class RequestInfo:
     def from_request(cls, request: Request, *, uses_auth: bool) -> "RequestInfo":
         return cls(
             request.method,
-            request.url,
+            urlsplit(request.url).path or "/",
             {
                 key: value
                 for key, value in request.headers.items()
