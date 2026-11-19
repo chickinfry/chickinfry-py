@@ -28,6 +28,10 @@ def main() -> None:
         for file in sorted(files)
     ]
     path.write_text(json.dumps(declaration, indent=2) + "\n")
+    realtime = {**declaration, "protocolVersion": 2}
+    path.with_name("conformance-driver-realtime.json").write_text(
+        json.dumps(realtime, indent=2) + "\n"
+    )
 
 
 if __name__ == "__main__":
