@@ -19,7 +19,16 @@ server = ["asyncpg==0.32.0; sys_platform != 'emscripten'"]
 packages = ["src/chickinfry"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "pyproject.toml", "README.md", "LICENSE", "requirements-dev.txt"]
+# Leading slashes anchor these to the project root. Without them a bare name like
+# README.md also matches the same file at any depth, which pulled build caches
+# such as .ci-cache/xdg/pytest/README.md into the published sdist.
+include = [
+    "/src",
+    "/pyproject.toml",
+    "/README.md",
+    "/LICENSE",
+    "/requirements-dev.txt",
+]
 
 [tool.ruff]
 target-version = "py311"
