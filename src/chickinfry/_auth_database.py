@@ -117,6 +117,107 @@ def _decode_app_auth_action_tokens(
 
 
 @dataclass(frozen=True, slots=True, kw_only=True, repr=False)
+class AppAuthDeviceRequestsRow:
+    approved_at: _builtins.str | None
+    consumed_at: _builtins.str | None
+    created_at: _builtins.str
+    device_code_hash: _builtins.str
+    device_name: _builtins.str | None
+    expires_at: _builtins.str
+    id: _builtins.str
+    last_polled_at: _builtins.str | None
+    status: _builtins.str
+    user_code_hash: _builtins.str
+    user_id: _builtins.str | None
+
+
+_app_auth_device_requests_table = Table(
+    "app_auth_device_requests",
+    {
+        "approved_at": Column[_builtins.str | None](
+            "approved_at",
+            "timestamp",
+            True,
+        ),
+        "consumed_at": Column[_builtins.str | None](
+            "consumed_at",
+            "timestamp",
+            True,
+        ),
+        "created_at": Column[_builtins.str](
+            "created_at",
+            "timestamp",
+            False,
+        ),
+        "device_code_hash": Column[_builtins.str](
+            "device_code_hash",
+            "string",
+            False,
+        ),
+        "device_name": Column[_builtins.str | None](
+            "device_name",
+            "string",
+            True,
+        ),
+        "expires_at": Column[_builtins.str](
+            "expires_at",
+            "timestamp",
+            False,
+        ),
+        "id": Column[_builtins.str](
+            "id",
+            "id",
+            False,
+        ),
+        "last_polled_at": Column[_builtins.str | None](
+            "last_polled_at",
+            "timestamp",
+            True,
+        ),
+        "status": Column[_builtins.str](
+            "status",
+            "string",
+            False,
+        ),
+        "user_code_hash": Column[_builtins.str](
+            "user_code_hash",
+            "string",
+            False,
+        ),
+        "user_id": Column[_builtins.str | None](
+            "user_id",
+            "id",
+            True,
+        ),
+    },
+    ("id",),
+    (
+        "device_code_hash",
+        "expires_at",
+        "user_code_hash",
+    ),
+)
+
+
+def _decode_app_auth_device_requests(
+    row: Mapping[_builtins.str, object],
+) -> AppAuthDeviceRequestsRow:
+    return AppAuthDeviceRequestsRow(
+        approved_at=_read_string_nullable(row["approved_at"]),
+        consumed_at=_read_string_nullable(row["consumed_at"]),
+        created_at=_read_string(row["created_at"]),
+        device_code_hash=_read_string(row["device_code_hash"]),
+        device_name=_read_string_nullable(row["device_name"]),
+        expires_at=_read_string(row["expires_at"]),
+        id=_read_string(row["id"]),
+        last_polled_at=_read_string_nullable(row["last_polled_at"]),
+        status=_read_string(row["status"]),
+        user_code_hash=_read_string(row["user_code_hash"]),
+        user_id=_read_string_nullable(row["user_id"]),
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True, repr=False)
 class AppAuthIdentitiesRow:
     created_at: _builtins.str
     provider: _builtins.str
@@ -718,6 +819,11 @@ class Database:
             port,
             _app_auth_action_tokens_table,
             _decode_app_auth_action_tokens,
+        )
+        self.device_requests = Repository(
+            port,
+            _app_auth_device_requests_table,
+            _decode_app_auth_device_requests,
         )
         self.identities = Repository(
             port,

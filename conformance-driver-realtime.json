@@ -42,7 +42,7 @@
     },
     {
       "path": "src/chickinfry/_auth_database.py",
-      "sha256": "e41f6a19cfd7eb2c14d286598888cd1dd5afc9091480c71ea40188f73d3171ce"
+      "sha256": "9975460597789f8a94fa3e9f4e7ac0f3b99fda002cff8e16a7b2b095f75b4b20"
     },
     {
       "path": "src/chickinfry/_conformance.py",
