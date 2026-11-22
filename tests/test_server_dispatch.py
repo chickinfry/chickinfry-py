@@ -475,6 +475,9 @@ async def test_routes_cors_and_auth_before_handler() -> None:
         ("POST", "missing.operation"),
         ("POST", "probe.echo?foo=bar"),
         ("POST", "probe.echo?"),
+        ("POST", "api/"),
+        ("POST", "api/api/probe.echo"),
+        ("POST", "apiprobe.echo"),
     ):
         assert (
             await app.fetch(
@@ -508,6 +511,13 @@ async def test_routes_cors_and_auth_before_handler() -> None:
     success = await app.fetch(BytesRequest([b'{"wire_value":"ok"}']))
     assert success.status == 200
     assert not any(name.lower() == "set-cookie" for name in success.headers)
+    # A web app address forwards the reserved /api path to the same operation.
+    prefixed = await app.fetch(
+        BytesRequest(
+            [b'{"wire_value":"ok"}'], url="https://example.test/api/probe.echo"
+        )
+    )
+    assert prefixed.status == 200 and prefixed.body == success.body
 
     probe.failure = OperationError("not_implemented", 501)
 
@@ -523,7 +533,7 @@ async def test_routes_cors_and_auth_before_handler() -> None:
     assert denied_session.status == 401 and json.loads(denied_session.body) == {
         "error": "unauthenticated"
     }
-    assert probe.calls == 1
+    assert probe.calls == 2
     assert not any(name.lower() == "set-cookie" for name in denied_session.headers)
 
 
@@ -872,6 +882,8 @@ async def test_workers_entry_admits_only_safe_request_headers(
     [
         ("https://example.test/items/a%2Fb?view=full#detail", "/items/a%2Fb"),
         ("https://example.test", "/"),
+        ("https://example.test/api/probe.echo", "/probe.echo"),
+        ("https://example.test/api/realtime", "/api/realtime"),
     ],
 )
 def test_request_info_extracts_only_the_path(url: str, path: str) -> None:

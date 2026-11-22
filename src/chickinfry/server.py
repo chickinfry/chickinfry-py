@@ -106,13 +106,23 @@ class RequestInfo:
     def from_request(cls, request: Request, *, uses_auth: bool) -> "RequestInfo":
         return cls(
             request.method,
-            urlsplit(request.url).path or "/",
+            operation_path(urlsplit(request.url).path or "/"),
             {
                 key: value
                 for key, value in request.headers.items()
                 if not uses_auth or key.lower() not in {"authorization", "cookie"}
             },
         )
+
+
+# A web app address forwards /api/<service>.<operation> unchanged (SAME-ORIGIN-DEFAULT);
+# every server language resolves it exactly as /<service>.<operation>.
+_API_OPERATION_PATH = re.compile(r"/api/[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*")
+
+
+def operation_path(path: str) -> str:
+    """Return the operation path that a reserved /api path stands for."""
+    return path[4:] if _API_OPERATION_PATH.fullmatch(path) else path
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,9 +281,8 @@ class Application(Generic[C]):
                 or url.fragment
             ):
                 raise OperationError("not_found", 404)
-            operation = (
-                self.operations.get(url.path[1:]) if url.path.startswith("/") else None
-            )
+            path = operation_path(url.path)
+            operation = self.operations.get(path[1:]) if path.startswith("/") else None
             if operation is None:
                 raise OperationError("not_found", 404)
             if (
