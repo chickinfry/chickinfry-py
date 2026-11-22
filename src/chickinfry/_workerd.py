@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import date, datetime
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from .auth import AuthHooks, AuthUser, IdentityProvider
@@ -472,6 +473,70 @@ class Storage:
         )
 
 
+class Realtime:
+    """The request-scoped realtime publisher."""
+
+    __slots__ = ("_owner",)
+
+    def __init__(self) -> None:
+        self._owner = _request.get()
+
+    def _active_request(self) -> _HostRequest:
+        owner = self._owner
+        if owner is None or owner.closed or _request.get() is not owner:
+            raise OperationError("service_unavailable", 503)
+        return owner
+
+    async def publish(self, channel: str, payload: object) -> None:
+        """Publish one JSON event on a channel."""
+        owner = self._active_request()
+        try:
+            frame = json.dumps(
+                {
+                    "rid": owner.rid,
+                    "op": "publish",
+                    "input": {"channel": channel, "payload": payload},
+                },
+                allow_nan=False,
+            ).encode()
+        except (TypeError, ValueError):
+            # A value the host frame cannot carry was never sent.
+            raise OperationError("operation_failed", 500) from None
+        _realtime_reply(await owner.bridge.realtime(owner.rid, frame))
+
+
+def _realtime_reply(data: bytes) -> None:
+    """Map one realtime host reply to the public publish result."""
+    try:
+        if len(data) > 4096:
+            raise ValueError
+        reply = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_object,
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
+        )
+        if not isinstance(reply, dict):
+            raise ValueError
+        if not reply:
+            return
+        error = reply.get("error")
+        status = reply.get("status")
+        if len(reply) == 1 and error == "binding_unavailable":
+            raise OperationError("service_unavailable", 503)
+        if (
+            len(reply) == 2
+            and isinstance(error, str)
+            and type(status) is int
+            and 400 <= status <= 599
+        ):
+            raise OperationError(error, status)
+        raise ValueError
+    except OperationError:
+        raise
+    except (ValueError, RecursionError):
+        raise OperationError("operation_failed", 500) from None
+
+
 class _JSBridge:
     def __init__(self, host: Any, ffi: Any, js: Any) -> None:
         self.host, self.ffi, self.js = host, ffi, js
@@ -479,6 +544,10 @@ class _JSBridge:
     async def db(self, frame: bytes) -> bytes:
         # Copy before yielding; no Python buffer is retained across the Promise.
         result = await self.host.db(self.binary(frame))
+        return bytes(result.to_py())
+
+    async def realtime(self, rid: int, frame: bytes) -> bytes:
+        result = await self.host.realtime(rid, self.binary(frame))
         return bytes(result.to_py())
 
     def binary(self, frame: bytes) -> Any:
@@ -729,3 +798,97 @@ async def _fetch(
             state.finish()
         finally:
             _request.reset(marker)
+
+
+def _realtime_authorize_path(request: Any) -> bool:
+    return (urlsplit(request.url).path or "/") == "/realtime.authorize"
+
+
+async def _realtime_request(
+    request: Any,
+    context: Any,
+    environment: Any,
+    options: object,
+    auth_config: str | None,
+    origins: frozenset[str],
+    decide: Callable[
+        [object, Any, Session | None, str | None, str, str], Awaitable[bool]
+    ]
+    | None,
+) -> object | None:
+    """Answer the realtime ticket and the engine authorization callback.
+
+    The JS host owns the origin rules, the engine proof checks and the publish
+    port; the language only routes the two reserved paths and forwards the
+    customer decision. Every other request returns None.
+    """
+    from importlib import import_module
+
+    path = urlsplit(request.url).path or "/"
+    if path not in ("/realtime.ticket", "/realtime.authorize"):
+        return None
+    state = _request.get()
+    if state is None or state.closed:
+        raise OperationError("operation_failed", 500)
+    workers = import_module("workers")
+    ffi = import_module("pyodide.ffi")
+    host = workers.import_from_javascript("_chik/host.js")
+    host.prepareRealtime(ffi.to_js(sorted(origins)))
+    if path == "/realtime.ticket":
+        ticket: object = await host.realtimeTicket(
+            state.rid, request.js_object, auth_config is not None
+        )
+        return ticket
+    props = getattr(context, "props", None)
+    if props is None or getattr(props, "realtime", None) is None:
+        missing: object = workers.Response(
+            '{"error":"not_found"}',
+            status=404,
+            headers={
+                "content-type": "application/json",
+                "cache-control": "no-store",
+            },
+        )
+        return missing
+
+    async def decision(metadata: str) -> str:
+        message = json.loads(metadata, object_pairs_hook=_object)
+        session = message["session"]
+        allowed = False
+        if decide is not None:
+            # The host verified the engine proof and revalidated the session before
+            # calling here, so the application decision may use the request's
+            # database like an authenticated operation.
+            marker = _request.set(state)
+            ready = state.business_ready
+            state.business_ready = True
+            try:
+                allowed = await decide(
+                    options,
+                    environment,
+                    None
+                    if session is None
+                    else Session(
+                        _text(session["id"]),
+                        User(
+                            _text(session["user"]["id"]),
+                            _text(session["user"]["email"]),
+                        ),
+                    ),
+                    message["origin"],
+                    message["appOrigin"],
+                    message["channel"],
+                )
+            finally:
+                state.business_ready = ready
+                _request.reset(marker)
+        return json.dumps(allowed is True)
+
+    callback = ffi.create_proxy(decision)
+    try:
+        authorized: object = await host.realtimeAuthorize(
+            state.rid, request.js_object, context, callback, auth_config
+        )
+        return authorized
+    finally:
+        callback.destroy()

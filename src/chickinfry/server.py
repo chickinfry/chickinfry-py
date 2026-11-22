@@ -429,6 +429,14 @@ class _SetupFailure:
     cancelled: bool
 
 
+# The realtime decision receives the application options, the request
+# environment, the revalidated session, the verified WebSocket origin and app
+# origin, and the channel.
+RealtimeDecision = Callable[
+    [object, object, Session | None, str | None, str, str], Awaitable[bool]
+]
+
+
 @overload
 def create_worker_entrypoint(
     factory: Callable[[object, object], Application[C]],
@@ -436,6 +444,9 @@ def create_worker_entrypoint(
     _secret_names: tuple[str, ...] = (),
     _vault: bool = False,
     _storage_names: tuple[str, ...] = (),
+    _realtime: bool = False,
+    _realtime_origins: frozenset[str] = frozenset(),
+    _realtime_decide: RealtimeDecision | None = None,
 ) -> type[object]: ...
 
 
@@ -450,6 +461,9 @@ def create_worker_entrypoint(
     _auth_config: str | None = None,
     _auth_hooks: Callable[[Options], "tuple[AuthHooks, Sequence[IdentityProvider]]"]
     | None = None,
+    _realtime: bool = False,
+    _realtime_origins: frozenset[str] = frozenset(),
+    _realtime_decide: RealtimeDecision | None = None,
 ) -> type[object]: ...
 
 
@@ -464,6 +478,9 @@ def create_worker_entrypoint(
     _auth_config: str | None = None,
     _auth_hooks: Callable[[Options], "tuple[AuthHooks, Sequence[IdentityProvider]]"]
     | None = None,
+    _realtime: bool = False,
+    _realtime_origins: frozenset[str] = frozenset(),
+    _realtime_decide: RealtimeDecision | None = None,
 ) -> type[object]:
     """Generated create_application returns a Default class composed with the factory.
 
@@ -480,11 +497,9 @@ def create_worker_entrypoint(
         environment = self.env
         if sys.platform == "emscripten":
             environment = getattr(self.env, "CHIK_LOCAL_BINDINGS", self.env)
-        if setup is None:
-            application = cast(Callable[[object, object], Application[C]], factory)(
-                environment, self.ctx
-            )
-        else:
+        incoming = request
+        options: Options | None = None
+        if setup is not None:
             task = cast(
                 asyncio.Task[Options | _SetupFailure] | None,
                 getattr(self, "_chickinfry_setup", None),
@@ -500,11 +515,27 @@ def create_worker_entrypoint(
 
                 task = asyncio.create_task(initialize())
                 setattr(self, "_chickinfry_setup", task)
-            options = await asyncio.shield(task)
-            if isinstance(options, _SetupFailure):
-                if options.cancelled:
+            resolved = await asyncio.shield(task)
+            if isinstance(resolved, _SetupFailure):
+                if resolved.cancelled:
                     raise asyncio.CancelledError from None
                 raise RuntimeError("Application setup failed.") from None
+            options = resolved
+            if _realtime and sys.platform == "emscripten":
+                from ._workerd import _realtime_authorize_path, _realtime_request
+
+                # The engine callback carries its own proof and no session, so it
+                # skips session authentication and is answered by the JS host.
+                if _realtime_authorize_path(request):
+                    return await _realtime_request(
+                        incoming,
+                        self.ctx,
+                        environment,
+                        options,
+                        _auth_config,
+                        _realtime_origins,
+                        _realtime_decide,
+                    )
             if (
                 sys.platform == "emscripten"
                 and _auth_config is not None
@@ -518,9 +549,29 @@ def create_worker_entrypoint(
                 )
                 if response is not None:
                     return response
-            application = cast(
-                Callable[[object, object, Options], Application[C]], factory
-            )(environment, self.ctx, options)
+        if _realtime and sys.platform == "emscripten":
+            from ._workerd import _realtime_request
+
+            early = await _realtime_request(
+                incoming,
+                self.ctx,
+                environment,
+                options,
+                _auth_config,
+                _realtime_origins,
+                _realtime_decide,
+            )
+            if early is not None:
+                return early
+        application = (
+            cast(Callable[[object, object], Application[C]], factory)(
+                environment, self.ctx
+            )
+            if setup is None
+            else cast(Callable[[object, object, Options], Application[C]], factory)(
+                environment, self.ctx, cast(Options, options)
+            )
+        )
         response = await application.fetch(_HostRequest(request))
         return response_factory(
             response.body.decode() if response.body else None,
