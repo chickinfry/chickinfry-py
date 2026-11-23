@@ -52,6 +52,30 @@ class OperationError(Exception):
         self.message, self.fields = message, fields
         super().__init__("Operation failed.")
 
+    # BEGIN generated operation errors
+
+    @staticmethod
+    def not_found() -> "OperationError":
+        return OperationError("not_found", 404)
+
+    @staticmethod
+    def invalid_input() -> "OperationError":
+        return OperationError("invalid_input", 400)
+
+    @staticmethod
+    def conflict() -> "OperationError":
+        return OperationError("conflict", 409)
+
+    @staticmethod
+    def forbidden() -> "OperationError":
+        return OperationError("forbidden", 403)
+
+    @staticmethod
+    def not_implemented() -> "OperationError":
+        return OperationError("not_implemented", 501)
+
+    # END generated operation errors
+
 
 @dataclass(frozen=True, slots=True)
 class User:

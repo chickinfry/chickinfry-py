@@ -94,7 +94,7 @@
     },
     {
       "path": "src/chickinfry/_workerd.py",
-      "sha256": "17a13f0fb32cb615852d066476955e72fed31712448155f3fa304ff5275c7807"
+      "sha256": "8504d9287b5c0bb798a65e6c4d4b0e7a30f6a1f81cf213e356c0675cd8020180"
     },
     {
       "path": "src/chickinfry/auth.py",
@@ -126,7 +126,7 @@
     },
     {
       "path": "src/chickinfry/server.py",
-      "sha256": "d9c77123ffba1847665089fd3c4b572e190e6cec70ab33a5236adb1d4e200890"
+      "sha256": "1c160254d11bc5d493723614324981e3e46455db3f047d27bd126df3ba4f6403"
     },
     {
       "path": "src/chickinfry/session.py",
