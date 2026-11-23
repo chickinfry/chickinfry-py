@@ -608,7 +608,7 @@ def create_worker_entrypoint(
 
         original = fetch
 
-        async def workerd_fetch(self: _Worker, request: _JSRequest) -> object:
+        async def fetch_with_host_context(self: _Worker, request: _JSRequest) -> object:
             return await _fetch(
                 original,
                 self,
@@ -619,6 +619,6 @@ def create_worker_entrypoint(
                 storage_names=_storage_names,
             )
 
-        return type("Default", (base,), {"fetch": workerd_fetch})
+        return type("Default", (base,), {"fetch": fetch_with_host_context})
 
     return type("Default", (base,), {"fetch": fetch})

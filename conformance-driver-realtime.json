@@ -126,7 +126,7 @@
     },
     {
       "path": "src/chickinfry/server.py",
-      "sha256": "1c160254d11bc5d493723614324981e3e46455db3f047d27bd126df3ba4f6403"
+      "sha256": "57922a260144e6b9775169a79cf54b6d7587480326bd21046f7775d5428fad18"
     },
     {
       "path": "src/chickinfry/session.py",
